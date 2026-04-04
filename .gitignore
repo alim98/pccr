@@ -1,0 +1,26 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environments and editor cruft
+.venv/
+venv/
+.env
+.DS_Store
+
+# Experiment outputs and heavy artifacts
+aim/
+logs/
+checkpoints/
+slurm/
+idea/
+# Model and report artifacts
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+
+# Generated evaluation artifacts
+*.csv
+*.png

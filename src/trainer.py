@@ -1,11 +1,13 @@
 import math
+from contextlib import nullcontext
+
 import torch
 from lightning import LightningModule
 
 from src import logger, checkpoints_dir
 from src.model.hvit import HViT
 from src.model.hvit_light import HViT_Light
-from src.loss import loss_functions, DiceScore
+from src.loss import loss_functions, DiceScore, DiceLoss
 from src.utils import get_one_hot
 
 dtype_map = {
@@ -15,7 +17,7 @@ dtype_map = {
 }
 
 class LiTHViT(LightningModule):
-    def __init__(self, args, config, wandb_logger=None, save_model_every_n_epochs=10):
+    def __init__(self, args, config, experiment_logger=None, save_model_every_n_epochs=10):
         super().__init__()
         self.automatic_optimization = False
         self.args = args
@@ -35,8 +37,24 @@ class LiTHViT(LightningModule):
             "dice": self.args.dice_weights,
             "grad": self.args.grad_weights
         }
-        self.wandb_logger = wandb_logger
+        self.dice_loss = DiceLoss(num_class=self.args.num_labels)
+        self.experiment_logger = experiment_logger
         self.test_step_outputs = []
+
+    def _autocast_context(self):
+        device_type = self.device.type if self.device is not None else "cpu"
+        dtype_ = dtype_map.get(self.precision, torch.float32)
+
+        if dtype_ == torch.float32:
+            return nullcontext()
+        if device_type == "cpu" and dtype_ != torch.bfloat16:
+            return nullcontext()
+        return torch.amp.autocast(device_type=device_type, dtype=dtype_)
+
+    def _log_metrics(self, metrics, step=None):
+        if self.experiment_logger is None:
+            return
+        self.experiment_logger.log_metrics(metrics, step=step)
 
     def _forward(self, batch, calc_score: bool = False, tgt2src_reg: bool = False):
         _loss = {}
@@ -45,7 +63,7 @@ class LiTHViT(LightningModule):
 
         dtype_ = dtype_map.get(self.precision, torch.float32)
 
-        with torch.amp.autocast(device_type="cuda", dtype=dtype_):
+        with self._autocast_context():
             if tgt2src_reg:
                 target, source = batch[0].to(dtype=dtype_), batch[1].to(dtype=dtype_)
                 tgt_seg, src_seg = batch[2], batch[3]
@@ -65,7 +83,7 @@ class LiTHViT(LightningModule):
                     _loss[key] = weight * loss_functions[key](moved, target)
                 elif key == "dice":
                     moved_seg = self._get_one_hot_from_src(src_seg, flow, self.args.num_labels)
-                    _loss[key] = weight * loss_functions[key](moved_seg, tgt_seg.long())
+                    _loss[key] = weight * self.dice_loss(moved_seg, tgt_seg.long())
                 elif key == "grad":
                     _loss[key] = weight * loss_functions[key](flow)
             
@@ -92,7 +110,7 @@ class LiTHViT(LightningModule):
             for key in loss1.keys()
         }
 
-        self.wandb_logger.log_metrics(total_loss, step=self.global_step)
+        self._log_metrics(total_loss, step=self.global_step)
         return total_loss
 
     def on_train_epoch_end(self):
@@ -102,7 +120,7 @@ class LiTHViT(LightningModule):
             logger.info(f"Saved model at epoch {self.current_epoch}")
         
         current_lr = self.optimizers().param_groups[0]['lr']
-        self.wandb_logger.log_metrics({"learning_rate": current_lr}, step=self.global_step)
+        self._log_metrics({"learning_rate": current_lr}, step=self.global_step)
 
 
     def validation_step(self, batch, batch_idx):
@@ -118,12 +136,12 @@ class LiTHViT(LightningModule):
         if _score is not None:
             self.log("val_score", _score.mean(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
     
-        # Log to wandb
+        # Log to the configured experiment tracker
         log_dict = {f"val_{k}": v.item() for k, v in _loss.items()}
         log_dict.update({
             "val_score_mean": _score.mean().item() if _score is not None else None,
         })
-        self.wandb_logger.log_metrics({k: v for k, v in log_dict.items() if v is not None}, step=self.global_step)
+        self._log_metrics({k: v for k, v in log_dict.items() if v is not None}, step=self.global_step)
     
         return {"val_loss": _loss["avg_loss"], "val_score": _score.mean().item()}
 
@@ -139,10 +157,10 @@ class LiTHViT(LightningModule):
                 self.best_val_loss = val_loss
                 best_model_path = f"{checkpoints_dir}/best_model.ckpt"
                 self.trainer.save_checkpoint(best_model_path)
-                self.wandb_logger.experiment.log({
-                    "best_model_saved": best_model_path,
+                self._log_metrics({
+                    "best_model_saved": 1.0,
                     "best_val_loss": self.best_val_loss.item()
-                })
+                }, step=self.global_step)
                 logger.info(f"New best model saved with validation loss: {self.best_val_loss:.4f}")
 
     def test_step(self, batch, batch_idx):
@@ -165,9 +183,8 @@ class LiTHViT(LightningModule):
     
         self.test_step_outputs.append(_score)   
 
-        # Log to wandb only if the logger is available
-        if self.wandb_logger:
-            self.wandb_logger.log_metrics({"test_dice": _score.item()}, step=self.global_step)
+        # Log to the configured experiment tracker only if available
+        self._log_metrics({"test_dice": _score.item()}, step=self.global_step)
 
         # Return as a dict with tensor values
         return {"test_dice": _score}
@@ -183,9 +200,8 @@ class LiTHViT(LightningModule):
         # Log the average test Dice score
         self.log("avg_test_dice", avg_test_dice, prog_bar=True)
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_metrics({"total_test_dice_avg": avg_test_dice.item()})
+        # Log to the configured experiment tracker if available
+        self._log_metrics({"total_test_dice_avg": avg_test_dice.item()})
 
         # Clear the test step outputs list for the next test epoch
         self.test_step_outputs.clear()
@@ -223,14 +239,14 @@ class LiTHViT(LightningModule):
         return math.pow(1 - epoch / max_epochs, 0.9)
 
     @classmethod
-    def load_from_checkpoint(cls, checkpoint_path, args=None, wandb_logger=None):
+    def load_from_checkpoint(cls, checkpoint_path, args=None, experiment_logger=None):
         """
         Loads a model from a checkpoint file.
         
         Args:
             checkpoint_path: Path to the checkpoint file.
             args: Optional arguments to override saved ones.
-            wandb_logger: Optional WandB logger instance.
+            experiment_logger: Optional experiment logger instance.
         
         Returns:
             An instance of the model loaded from the checkpoint.
@@ -240,7 +256,8 @@ class LiTHViT(LightningModule):
         args = args or checkpoint.get('hyper_parameters', {}).get('args')
         config = checkpoint.get('hyper_parameters', {}).get('config')
         
-        model = cls(args, config, wandb_logger)
+        save_every = getattr(args, "save_model_every_n_epochs", 10) if args is not None else 10
+        model = cls(args, config, experiment_logger, save_model_every_n_epochs=save_every)
         model.load_state_dict(checkpoint['state_dict'])
 
         if 'hyper_parameters' in checkpoint:
@@ -282,4 +299,3 @@ class LiTHViT(LightningModule):
             for i in range(num_labels)
         ]
         return torch.cat(deformed_segs, dim=1)
-

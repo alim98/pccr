@@ -1,0 +1,36 @@
+data_size:
+  - 40
+  - 48
+  - 56
+in_channels: 1
+stage_channels:
+  - 32
+  - 64
+  - 128
+  - 256
+kernel_size: 3
+descriptor_dim: 32
+context_dim: 128
+matcher_temperature: 0.07
+matcher_topk: 24
+canonical_radius: 0.45
+pointmap_stage_ids:
+  - 2
+  - 3
+decoder_stage_ids:
+  - 3
+  - 2
+  - 1
+  - 0
+svf_integration_steps: 7
+decoder_channels: 64
+num_matchability_classes: 3
+use_fine_local_refinement: true
+image_loss: lncc
+synthetic_warp_scale: 2.5
+synthetic_control_grid:
+  - 5
+  - 6
+  - 7
+phase: real
+num_labels: 86

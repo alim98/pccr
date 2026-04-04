@@ -7,10 +7,12 @@
 # H-Vit specific dependencies
 einops
 timm
+nibabel
 
 #training
 lightning
-wandb
+aim
+setuptools<81
 
 # dataloader
 monai

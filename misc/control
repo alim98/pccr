@@ -1,0 +1,1 @@
+squeue -u $USER -o "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R" && echo "" && for job in $(squeue -u $USER -h -o "%i"); do echo "=== Job $job ===" && scontrol show job $job | grep -E "JobId|JobName|JobState|Reason|Priority|StartTime|RunTime|TimeLimit|NumNodes|NumCPUs|ReqTRES"; echo ""; done

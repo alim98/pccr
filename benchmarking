@@ -1,0 +1,9 @@
+hvit : /u/almik/others/hvit/logs/hvit_oasis_4gpu_eval_fullval/summary.json
+
+pccr: /u/almik/others/hvit/logs/pccr/pccr_oasis_real_20260329-100814_eval_fullval_rerun/summary.json
+
+
+pccrv2: /u/almik/others/hvit/logs/pccr/pccr_oasis_real_long_v2_20260403_eval_fullval_epoch574/summary.json
+
+
+pccrv3: /u/almik/others/hvit/logs/pccr/pccr_oasis_real_v3_20260404_eval_fullval_epoch255/summary.json
