@@ -4,12 +4,14 @@ from argparse import Namespace
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
 
 from src.loss import DiceScore
 from src.pccr.config import PCCRConfig
 from src.pccr.losses import RegistrationCriterion, SyntheticTargets
 from src.pccr.model import PCCRModel
+from src.pccr.utils import voxel_grid
 from src.utils import get_one_hot
 
 
@@ -37,13 +39,21 @@ class LiTPCCR(LightningModule):
             inverse_consistency_weight=config.inverse_consistency_weight,
             correspondence_weight=config.correspondence_weight,
             residual_velocity_weight=config.residual_velocity_weight,
+            decoder_fitting_weight=config.decoder_fitting_weight,
+            decoder_fitting_detach_target=config.decoder_fitting_detach_target,
+            decoder_fitting_entropy_threshold=config.decoder_fitting_entropy_threshold,
+            decoder_fitting_confidence_percentile=config.decoder_fitting_confidence_percentile,
+            decoder_fitting_margin_power=config.decoder_fitting_margin_power,
+            decoder_fitting_margin_min=config.decoder_fitting_margin_min,
             num_labels=config.num_labels,
         )
         self.experiment_logger = experiment_logger
         self.lr = args.lr
         self.test_outputs = []
         self._freeze_state = ""
-        if self.args.phase == "real" and self.config.refinement_warmup_epochs > 0:
+        if getattr(self.args, "freeze_mode", "full") != "full":
+            self._apply_explicit_freeze_mode()
+        elif self.args.phase == "real" and self.config.refinement_warmup_epochs > 0:
             self._freeze_encoder_and_canonical_heads()
 
     def _log_metrics(self, metrics: dict[str, float | torch.Tensor], step: int | None = None):
@@ -87,12 +97,118 @@ class LiTPCCR(LightningModule):
         except Exception:
             return False
 
-    def forward(self, source: torch.Tensor, target: torch.Tensor):
-        return self.model(source, target)
+    def forward(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        oracle_canonical_source: torch.Tensor | None = None,
+        oracle_canonical_target: torch.Tensor | None = None,
+        oracle_dense_s2t: torch.Tensor | None = None,
+        oracle_dense_t2s: torch.Tensor | None = None,
+    ):
+        return self.model(
+            source,
+            target,
+            oracle_canonical_source=oracle_canonical_source,
+            oracle_canonical_target=oracle_canonical_target,
+            oracle_dense_s2t=oracle_dense_s2t,
+            oracle_dense_t2s=oracle_dense_t2s,
+        )
+
+    @staticmethod
+    def _gaussian_kernel1d(sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if sigma <= 0:
+            return torch.ones(1, device=device, dtype=dtype)
+        radius = max(1, int(round(2.5 * sigma)))
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel = kernel / kernel.sum().clamp_min(1e-8)
+        return kernel
+
+    @classmethod
+    def _gaussian_smooth_3d(cls, tensor: torch.Tensor, sigma: float) -> torch.Tensor:
+        if sigma <= 0:
+            return tensor
+        kernel_1d = cls._gaussian_kernel1d(sigma, tensor.device, tensor.dtype)
+        radius = kernel_1d.numel() // 2
+        smoothed = tensor
+        for kernel_shape, padding in [
+            ((kernel_1d.numel(), 1, 1), (0, 0, 0, 0, radius, radius)),
+            ((1, kernel_1d.numel(), 1), (0, 0, radius, radius, 0, 0)),
+            ((1, 1, kernel_1d.numel()), (radius, radius, 0, 0, 0, 0)),
+        ]:
+            weight = kernel_1d.view(1, 1, *kernel_shape).repeat(smoothed.shape[1], 1, 1, 1, 1)
+            smoothed = F.pad(smoothed, padding, mode="replicate")
+            smoothed = F.conv3d(smoothed, weight, groups=smoothed.shape[1])
+        return smoothed
+
+    @classmethod
+    def _build_oracle_dense_displacement(
+        cls,
+        source_label: torch.Tensor,
+        target_label: torch.Tensor,
+        sigma: float,
+    ) -> torch.Tensor:
+        batch_size = source_label.shape[0]
+        spatial_shape = tuple(source_label.shape[2:])
+        grid = voxel_grid(spatial_shape, source_label.device).expand(batch_size, -1, -1, -1, -1)
+        dense_fields = []
+        for batch_index in range(batch_size):
+            source_seg = source_label[batch_index, 0]
+            target_seg = target_label[batch_index, 0]
+            dense = source_label.new_zeros((3, *spatial_shape), dtype=torch.float32)
+            support = source_label.new_zeros((1, *spatial_shape), dtype=torch.float32)
+            labels = torch.unique(torch.cat([source_seg.reshape(-1), target_seg.reshape(-1)]))
+            for label_value in labels.tolist():
+                if int(label_value) == 0:
+                    continue
+                source_mask = source_seg == int(label_value)
+                target_mask = target_seg == int(label_value)
+                if not source_mask.any() or not target_mask.any():
+                    continue
+                source_center = grid[batch_index, :, source_mask].mean(dim=1)
+                target_center = grid[batch_index, :, target_mask].mean(dim=1)
+                delta = (target_center - source_center).to(dense.dtype)
+                dense[:, source_mask] = delta.unsqueeze(-1)
+                support[:, source_mask] = 1.0
+
+            dense = dense.unsqueeze(0)
+            support = support.unsqueeze(0)
+            smoothed_dense = cls._gaussian_smooth_3d(dense * support, sigma=sigma)
+            smoothed_support = cls._gaussian_smooth_3d(support, sigma=sigma)
+            dense = smoothed_dense / smoothed_support.clamp_min(1e-4)
+            dense = torch.where(smoothed_support > 1e-4, dense, torch.zeros_like(dense))
+            dense_fields.append(dense.squeeze(0))
+        return torch.stack(dense_fields, dim=0)
 
     def _compute_loss(self, batch):
         source, target, source_label, target_label = batch[:4]
-        outputs = self(source, target)
+        oracle_canonical_source = None
+        oracle_canonical_target = None
+        oracle_dense_s2t = None
+        oracle_dense_t2s = None
+        if getattr(self.args, "oracle_correspondence", "none") == "synthetic_gt" and len(batch) >= 6:
+            oracle_canonical_source = batch[4]
+            oracle_canonical_target = batch[5]
+        if getattr(self.config, "diagnostic_oracle_handoff", False):
+            oracle_dense_s2t = self._build_oracle_dense_displacement(
+                source_label=source_label,
+                target_label=target_label,
+                sigma=self.config.oracle_handoff_gaussian_sigma,
+            )
+            oracle_dense_t2s = self._build_oracle_dense_displacement(
+                source_label=target_label,
+                target_label=source_label,
+                sigma=self.config.oracle_handoff_gaussian_sigma,
+            )
+        outputs = self(
+            source,
+            target,
+            oracle_canonical_source=oracle_canonical_source,
+            oracle_canonical_target=oracle_canonical_target,
+            oracle_dense_s2t=oracle_dense_s2t,
+            oracle_dense_t2s=oracle_dense_t2s,
+        )
         synthetic_targets = None
         if self.args.phase == "synthetic":
             synthetic_targets = SyntheticTargets(
@@ -127,7 +243,42 @@ class LiTPCCR(LightningModule):
         self._set_requires_grad(self.model, True)
         self._freeze_state = "full"
 
+    def _set_trainable_modules(self, *modules):
+        self._set_requires_grad(self.model, False)
+        for module in modules:
+            if module is not None:
+                self._set_requires_grad(module, True)
+
+    def _apply_explicit_freeze_mode(self):
+        freeze_mode = getattr(self.args, "freeze_mode", "full")
+        if freeze_mode == "full":
+            self._unfreeze_all_modules()
+            return
+
+        if freeze_mode == "final_refinement":
+            self._set_trainable_modules(
+                getattr(self.model.decoder, "final_refinement_head", None),
+                getattr(self.model.decoder, "image_error_encoder", None),
+                getattr(self.model.decoder, "local_cost_volume_encoder", None),
+                getattr(self.model.decoder, "local_residual_matcher", None),
+            )
+        elif freeze_mode == "coarse_decoder":
+            self._set_trainable_modules(self.model.decoder.stage_decoders)
+        elif freeze_mode == "matcher":
+            # Train the full correspondence branch, including any learned matcher refinement.
+            self._set_trainable_modules(self.model.encoder, self.model.pointmap_head, self.model.matcher)
+        elif freeze_mode == "decoder_and_refinement":
+            self._set_trainable_modules(self.model.decoder)
+        else:
+            raise ValueError(f"Unsupported freeze mode: {freeze_mode}")
+
+        self._freeze_state = freeze_mode
+
     def _apply_training_stage(self):
+        if getattr(self.args, "freeze_mode", "full") != "full":
+            if self._freeze_state != getattr(self.args, "freeze_mode", "full"):
+                self._apply_explicit_freeze_mode()
+            return
         if self.args.phase != "real" or self.config.refinement_warmup_epochs <= 0:
             if self._freeze_state != "full":
                 self._unfreeze_all_modules()
@@ -202,17 +353,27 @@ class LiTPCCR(LightningModule):
         parameter_groups = {
             "encoder": {"params": [], "lr": self.lr * self.config.encoder_lr_scale},
             "pointmap": {"params": [], "lr": self.lr * self.config.canonical_head_lr_scale},
+            "matcher": {"params": [], "lr": self.lr * self.config.canonical_head_lr_scale},
             "decoder": {"params": [], "lr": self.lr * self.config.coarse_decoder_lr_scale},
             "refinement": {"params": [], "lr": self.lr * self.config.residual_refinement_lr_scale},
             "other": {"params": [], "lr": self.lr},
         }
 
         for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
             if name.startswith("model.encoder."):
                 parameter_groups["encoder"]["params"].append(parameter)
             elif name.startswith("model.pointmap_head."):
                 parameter_groups["pointmap"]["params"].append(parameter)
-            elif name.startswith("model.decoder.final_refinement_head."):
+            elif name.startswith("model.matcher."):
+                parameter_groups["matcher"]["params"].append(parameter)
+            elif (
+                name.startswith("model.decoder.final_refinement_head.")
+                or name.startswith("model.decoder.image_error_encoder.")
+                or name.startswith("model.decoder.local_cost_volume_encoder.")
+                or name.startswith("model.decoder.local_residual_matcher.")
+            ):
                 parameter_groups["refinement"]["params"].append(parameter)
             elif name.startswith("model.decoder."):
                 parameter_groups["decoder"]["params"].append(parameter)
@@ -260,7 +421,31 @@ class LiTPCCR(LightningModule):
             config = PCCRConfig(**hyper_parameters.get("config", {}))
 
         model = cls(args=args, config=config, experiment_logger=experiment_logger)
-        model.load_state_dict(checkpoint["state_dict"], strict=strict)
+        state_dict = checkpoint["state_dict"]
+        if strict:
+            model.load_state_dict(state_dict, strict=True)
+            return model
+
+        model_state = model.state_dict()
+        filtered_state_dict = {}
+        skipped_keys = []
+        for key, value in state_dict.items():
+            if key not in model_state:
+                skipped_keys.append(key)
+                continue
+            if model_state[key].shape != value.shape:
+                skipped_keys.append(key)
+                continue
+            filtered_state_dict[key] = value
+
+        incompatible = model.load_state_dict(filtered_state_dict, strict=False)
+        if skipped_keys:
+            print(
+                f"[LiTPCCR] Skipped {len(skipped_keys)} incompatible checkpoint keys while loading "
+                f"{checkpoint_path}."
+            )
+        if incompatible.missing_keys:
+            print(f"[LiTPCCR] Missing keys after partial checkpoint load: {len(incompatible.missing_keys)}")
         return model
 
     def on_save_checkpoint(self, checkpoint):

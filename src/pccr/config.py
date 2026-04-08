@@ -18,6 +18,12 @@ class PCCRConfig:
     matcher_temperature: float = 0.07
     matcher_topk: int = 24
     canonical_radius: float = 0.45
+    matcher_type: str = "canonical_soft"
+    matcher_confidence_mode: str = "max_prob"
+    refined_matcher_hidden_dim: int = 64
+    refined_matcher_offset_scale: float = 0.5
+    refined_matcher_output_mode: str = "topm_reweighted"
+    refined_matcher_topm: int = 2
     pointmap_stage_ids: list[int] = field(default_factory=lambda: [2, 3])
     decoder_stage_ids: list[int] = field(default_factory=lambda: [3, 2, 1, 0])
     svf_integration_steps: int = 7
@@ -28,6 +34,30 @@ class PCCRConfig:
     use_final_residual_refinement: bool = False
     final_refinement_hidden_channels: int = 32
     final_refinement_max_velocity: float = 0.2
+    final_refinement_num_blocks: int = 2
+    final_refinement_activation: str = "gelu"
+    final_refinement_use_image_error_inputs: bool = False
+    final_refinement_include_raw_image_error_inputs: bool = False
+    final_refinement_image_error_channels: int = 16
+    final_refinement_use_error_edges: bool = False
+    final_refinement_use_local_cost_volume: bool = False
+    final_refinement_cost_volume_radius: int = 0
+    final_refinement_cost_volume_proj_channels: int = 16
+    final_refinement_cost_volume_feature_channels: int = 16
+    final_refinement_use_local_residual_matcher: bool = False
+    final_refinement_local_matcher_radius: int = 0
+    final_refinement_local_matcher_proj_channels: int = 16
+    final_refinement_local_matcher_feature_channels: int = 16
+    final_refinement_local_matcher_temperature: float = 1.0
+    diagnostic_residual_only: bool = False
+    diagnostic_oracle_correspondence: bool = False
+    diagnostic_oracle_handoff: bool = False
+    oracle_handoff_gaussian_sigma: float = 1.0
+    use_stage1_local_refinement: bool = False
+    stage1_local_refinement_radius: int = 0
+    stage1_local_refinement_proj_channels: int = 16
+    stage1_local_refinement_feature_channels: int = 16
+    stage1_local_refinement_temperature: float = 1.0
     image_loss: str = "lncc"
     multiscale_similarity_factors: list[int] = field(default_factory=lambda: [1])
     multiscale_similarity_weights: list[float] = field(default_factory=lambda: [1.0])
@@ -38,8 +68,15 @@ class PCCRConfig:
     inverse_consistency_weight: float = 0.1
     correspondence_weight: float = 0.2
     residual_velocity_weight: float = 0.0
+    decoder_fitting_weight: float = 0.0
+    decoder_fitting_detach_target: bool = True
+    decoder_fitting_entropy_threshold: float = -1.0
+    decoder_fitting_confidence_percentile: float = 0.0
+    decoder_fitting_margin_power: float = 0.0
+    decoder_fitting_margin_min: float = 0.0
     matchability_score_mode: str = "legacy"
     matchability_score_power: float = 0.5
+    synthetic_refresh_required: bool = False
     refinement_warmup_epochs: int = 0
     encoder_lr_scale: float = 1.0
     canonical_head_lr_scale: float = 1.0
@@ -58,3 +95,10 @@ class PCCRConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def apply_overrides(self, overrides: dict[str, Any]) -> "PCCRConfig":
+        for key, value in overrides.items():
+            if not hasattr(self, key):
+                raise KeyError(f"Unknown PCCRConfig field: {key}")
+            setattr(self, key, value)
+        return self

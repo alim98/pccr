@@ -8,7 +8,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from src.data.datasets import discover_oasis_subjects, get_dataloader, normalize_image
+from src.data.datasets import (
+    OASISFolderDataset,
+    OASIS_PklDataset,
+    discover_oasis_subjects,
+    get_dataloader,
+    normalize_image,
+)
 from src.model.transformation import SpatialTransformer
 from src.pccr.utils import normalize_grid, voxel_grid
 
@@ -47,7 +53,16 @@ class OASISSingleSubjectDataset(Dataset):
 
 
 class SyntheticOASISPairDataset(Dataset):
-    def __init__(self, data_root: str, input_dim: list[int], warp_scale: float, control_grid: list[int]) -> None:
+    def __init__(
+        self,
+        data_root: str,
+        input_dim: list[int],
+        warp_scale: float,
+        control_grid: list[int],
+        num_steps: int | None = None,
+        deterministic: bool = False,
+        base_seed: int = 0,
+    ) -> None:
         self.base_dataset = OASISSingleSubjectDataset(data_root, input_dim)
         self.input_dim = tuple(input_dim)
         self.warp_scale = warp_scale
@@ -55,24 +70,39 @@ class SyntheticOASISPairDataset(Dataset):
         self.transformer = SpatialTransformer(self.input_dim)
         self.nearest_transformer = SpatialTransformer(self.input_dim, mode="nearest")
         self.num_labels = self.base_dataset.num_labels
+        self.num_steps = int(num_steps) if num_steps is not None and num_steps > 0 else len(self.base_dataset)
+        self.deterministic = deterministic
+        self.base_seed = int(base_seed)
 
     def __len__(self) -> int:
-        return len(self.base_dataset)
+        return self.num_steps
 
-    def _random_flow(self, image: torch.Tensor) -> torch.Tensor:
-        flow = torch.randn(1, 3, *self.control_grid, dtype=image.dtype) * self.warp_scale
+    def _make_generator(self, index: int) -> torch.Generator | None:
+        if not self.deterministic:
+            return None
+        generator = torch.Generator()
+        generator.manual_seed(self.base_seed + index)
+        return generator
+
+    def _random_flow(self, image: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        flow = torch.randn(1, 3, *self.control_grid, dtype=image.dtype, generator=generator) * self.warp_scale
         flow = F.interpolate(flow, size=self.input_dim, mode="trilinear", align_corners=False)
         return flow
 
-    def _augment_intensity(self, image: torch.Tensor) -> torch.Tensor:
-        gain = torch.empty(1).uniform_(0.9, 1.1).item()
-        bias = torch.empty(1).uniform_(-0.05, 0.05).item()
-        gamma = torch.empty(1).uniform_(0.85, 1.15).item()
+    def _augment_intensity(self, image: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        gain = torch.empty(1).uniform_(0.9, 1.1, generator=generator).item()
+        bias = torch.empty(1).uniform_(-0.05, 0.05, generator=generator).item()
+        gamma = torch.empty(1).uniform_(0.85, 1.15, generator=generator).item()
 
         augmented = image.clamp(0.0, 1.0).pow(gamma)
         augmented = augmented * gain + bias
-        augmented = augmented + 0.02 * torch.randn_like(augmented)
-        if torch.rand(1).item() < 0.3:
+        augmented = augmented + 0.02 * torch.randn(
+            augmented.shape,
+            dtype=augmented.dtype,
+            device=augmented.device,
+            generator=generator,
+        )
+        if torch.rand(1, generator=generator).item() < 0.3:
             augmented = F.avg_pool3d(augmented, kernel_size=3, stride=1, padding=1)
         return augmented.clamp(0.0, 1.0)
 
@@ -103,15 +133,16 @@ class SyntheticOASISPairDataset(Dataset):
         return targets
 
     def __getitem__(self, index: int):
-        image, label = self.base_dataset[index]
+        generator = self._make_generator(index)
+        image, label = self.base_dataset[index % len(self.base_dataset)]
         image = image.unsqueeze(0)
         label = label.unsqueeze(0)
 
-        source_flow = self._random_flow(image)
-        target_flow = self._random_flow(image)
+        source_flow = self._random_flow(image, generator=generator)
+        target_flow = self._random_flow(image, generator=generator)
 
-        source = self._augment_intensity(self.transformer(image, source_flow)).squeeze(0)
-        target = self._augment_intensity(self.transformer(image, target_flow)).squeeze(0)
+        source = self._augment_intensity(self.transformer(image, source_flow), generator=generator).squeeze(0)
+        target = self._augment_intensity(self.transformer(image, target_flow), generator=generator).squeeze(0)
         source_label = self.nearest_transformer(label.float(), source_flow).long().squeeze(0)
         target_label = self.nearest_transformer(label.float(), target_flow).long().squeeze(0)
 
@@ -177,6 +208,7 @@ def create_synthetic_dataloader(args, config):
         input_dim=config.data_size,
         warp_scale=config.synthetic_warp_scale,
         control_grid=config.synthetic_control_grid,
+        num_steps=args.train_num_steps,
     )
     return DataLoader(
         dataset,
@@ -184,3 +216,100 @@ def create_synthetic_dataloader(args, config):
         shuffle=True,
         num_workers=args.num_workers,
     )
+
+
+def create_synthetic_pair_dataloaders(args, config):
+    train_dataset = SyntheticOASISPairDataset(
+        data_root=args.train_data_path,
+        input_dim=config.data_size,
+        warp_scale=config.synthetic_warp_scale,
+        control_grid=config.synthetic_control_grid,
+        num_steps=args.train_num_steps,
+        deterministic=False,
+    )
+    val_steps = args.max_val_pairs if args.max_val_pairs > 0 else min(max(args.train_num_steps // 2, 20), 200)
+    val_dataset = SyntheticOASISPairDataset(
+        data_root=args.val_data_path,
+        input_dim=config.data_size,
+        warp_scale=config.synthetic_warp_scale,
+        control_grid=config.synthetic_control_grid,
+        num_steps=val_steps,
+        deterministic=True,
+        base_seed=args.split_seed,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    return train_loader, val_loader
+
+
+def build_real_pair_dataset(
+    data_path: str,
+    input_dim: list[int],
+    dataset_format: str,
+    split: str,
+    val_fraction: float,
+    split_seed: int,
+    max_subjects: int = 0,
+    max_pairs: int = 0,
+):
+    resolved_format = dataset_format if dataset_format != "auto" else "oasis_fs"
+    if resolved_format == "pkl":
+        dataset = OASIS_PklDataset(
+            input_dim=input_dim,
+            data_path=data_path,
+            num_steps=max_pairs if max_pairs > 0 else 1000,
+            is_pair=True,
+        )
+        if max_pairs > 0:
+            dataset.paths = sorted(dataset.paths)[:max_pairs]
+        return dataset
+
+    if resolved_format == "oasis_fs":
+        return OASISFolderDataset(
+            input_dim=input_dim,
+            data_path=data_path,
+            split=split,
+            is_pair=True,
+            val_fraction=val_fraction,
+            split_seed=split_seed,
+            max_subjects=max_subjects,
+            max_pairs=max_pairs,
+        )
+
+    raise ValueError(f"Unsupported dataset format: {dataset_format}")
+
+
+def create_overfit_pair_dataloaders(args, config):
+    dataset = build_real_pair_dataset(
+        data_path=args.val_data_path,
+        input_dim=config.data_size,
+        dataset_format=args.dataset_format,
+        split=args.overfit_split,
+        val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
+        max_subjects=args.max_val_subjects,
+        max_pairs=args.overfit_num_pairs,
+    )
+    train_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    val_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    return train_loader, val_loader

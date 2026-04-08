@@ -12,7 +12,6 @@ from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
-from src.pccr.config import PCCRConfig
 from src.pccr.data import (
     create_overfit_pair_dataloaders,
     create_real_pair_dataloaders,
@@ -20,7 +19,8 @@ from src.pccr.data import (
     create_synthetic_pair_dataloaders,
 )
 from src.pccr.periodic_eval import IterativeEvalCallback
-from src.pccr.trainer import LiTPCCR
+from src.pccr_v6.config import PCCRV6Config
+from src.pccr_v6.trainer import LiTPCCRV6
 
 
 def load_aim_logger_class():
@@ -37,8 +37,8 @@ def load_aim_logger_class():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train or evaluate the PCCR research codebase.")
-    parser.add_argument("--config", type=str, default="src/pccr/configs/pairwise_oasis.yaml")
+    parser = argparse.ArgumentParser(description="Train or evaluate the PCCR v6 research codebase.")
+    parser.add_argument("--config", type=str, default="src/pccr_v6/configs/pairwise_oasis_v6a.yaml")
     parser.add_argument("--config_override", action="append", default=[])
     parser.add_argument("--mode", choices=["train", "test"], default="train")
     parser.add_argument("--phase", choices=["real", "synthetic"], default="real")
@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--max_val_pairs", type=int, default=0)
     parser.add_argument("--logger_backend", choices=["aim", "csv", "none"], default="aim")
     parser.add_argument("--aim_repo", type=str, default="/u/almik/others/hvit/aim")
-    parser.add_argument("--experiment_name", type=str, default="pccr_oasis")
+    parser.add_argument("--experiment_name", type=str, default="pccr_v6_oasis")
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--limit_train_batches", type=float, default=1.0)
@@ -114,7 +114,7 @@ def resolve_strategy(accelerator: str, devices: int) -> str:
     return "auto"
 
 
-def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCCRConfig:
+def apply_config_overrides(config: PCCRV6Config, override_items: list[str]) -> PCCRV6Config:
     if not override_items:
         return config
 
@@ -130,14 +130,14 @@ def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCC
 def main():
     args = parse_args()
     torch.set_float32_matmul_precision("high")
-    config = apply_config_overrides(PCCRConfig.from_yaml(args.config), args.config_override)
+    config = apply_config_overrides(PCCRV6Config.from_yaml(args.config), args.config_override)
     config.phase = args.phase
     if args.oracle_correspondence != "none":
         config.diagnostic_oracle_correspondence = True
     if args.oracle_handoff:
         config.diagnostic_oracle_handoff = True
     experiment_logger = build_logger(args)
-    checkpoint_dir = Path("checkpoints") / "pccr" / args.experiment_name
+    checkpoint_dir = Path("checkpoints") / "pccr_v6" / args.experiment_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_data_source = args.data_source
@@ -183,11 +183,11 @@ def main():
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 precision=args.precision if accelerator == "gpu" else "32-true",
-                output_dir=Path("logs") / "pccr" / args.experiment_name / "iter_eval",
+                output_dir=Path("logs") / "pccr_v6" / args.experiment_name / "iter_eval",
                 include_hd95=not args.iter_eval_skip_hd95,
                 visualization_every_n_epochs=args.iter_viz_every_n_epochs,
                 visualization_pair_index=args.iter_viz_pair_index,
-                visualization_dir=Path("logs") / "pccr" / args.experiment_name / "iter_viz",
+                visualization_dir=Path("logs") / "pccr_v6" / args.experiment_name / "iter_viz",
             )
         )
 
@@ -197,7 +197,7 @@ def main():
         max_epochs=args.max_epochs,
         logger=experiment_logger,
         callbacks=callbacks,
-        default_root_dir=str(Path("logs") / "pccr" / args.experiment_name),
+        default_root_dir=str(Path("logs") / "pccr_v6" / args.experiment_name),
         precision=args.precision if accelerator == "gpu" else "32-true",
         strategy=resolve_strategy(accelerator, devices),
         gradient_clip_val=1.0,
@@ -209,7 +209,7 @@ def main():
 
     if args.mode == "train":
         if args.resume_from_checkpoint:
-            model = LiTPCCR(args=args, config=config, experiment_logger=experiment_logger)
+            model = LiTPCCRV6(args=args, config=config, experiment_logger=experiment_logger)
             trainer.fit(
                 model,
                 train_dataloaders=train_loader,
@@ -218,7 +218,7 @@ def main():
             )
         else:
             if args.checkpoint_path:
-                model = LiTPCCR.load_from_checkpoint(
+                model = LiTPCCRV6.load_from_checkpoint(
                     args.checkpoint_path,
                     args=args,
                     config=config,
@@ -226,14 +226,14 @@ def main():
                     strict=False,
                 )
             else:
-                model = LiTPCCR(args=args, config=config, experiment_logger=experiment_logger)
+                model = LiTPCCRV6(args=args, config=config, experiment_logger=experiment_logger)
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     else:
         if val_loader is None:
             raise ValueError("Test mode requires a real validation/test dataloader.")
         if not args.checkpoint_path:
             raise ValueError("Test mode requires --checkpoint_path.")
-        model = LiTPCCR.load_from_checkpoint(
+        model = LiTPCCRV6.load_from_checkpoint(
             args.checkpoint_path,
             args=args,
             config=config,

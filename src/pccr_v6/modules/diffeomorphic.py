@@ -7,131 +7,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.transformation import SpatialTransformer
-from src.pccr.utils import resize_displacement, softmax_entropy
+from src.pccr.modules.diffeomorphic import (
+    DecoderOutputs,
+    FinalResidualRefinementHead,
+    ImageErrorEncoder,
+    LocalCostVolumeEncoder,
+    LocalResidualMatcher,
+    ScalingAndSquaring,
+    StageLocalCorrelationRefiner,
+    StageVelocityDecoder,
+    compose_displacement_fields,
+)
+from src.pccr.utils import resize_displacement
 
 
-def compose_displacement_fields(
-    first: torch.Tensor, second: torch.Tensor, transformer: SpatialTransformer
-) -> torch.Tensor:
-    return first + transformer(second, first)
+@dataclass
+class _LocalRefinementContext:
+    raw_displacement: torch.Tensor
+    confidence: torch.Tensor
+    margin: torch.Tensor
+    entropy: torch.Tensor
+    target_displacement: torch.Tensor
+    extra_features: torch.Tensor
 
 
-class ScalingAndSquaring(nn.Module):
-    def __init__(self, size: tuple[int, int, int], steps: int = 7) -> None:
+class StructuredMatchEvidenceEncoder(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        self.steps = steps
-        self.transformer = SpatialTransformer(size)
-
-    def forward(self, velocity: torch.Tensor) -> torch.Tensor:
-        displacement = velocity / (2 ** self.steps)
-        for _ in range(self.steps):
-            displacement = displacement + self.transformer(displacement, displacement)
-        return displacement
-
-
-class StageVelocityDecoder(nn.Module):
-    def __init__(
-        self,
-        feature_channels: int,
-        hidden_channels: int,
-        max_velocity: float,
-        extra_channels: int = 0,
-    ) -> None:
-        super().__init__()
-        self.max_velocity = max_velocity
-        self.extra_channels = extra_channels
-        in_channels = feature_channels * 2 + 3 + 1 + 1 + extra_channels
-        self.net = nn.Sequential(
-            nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(hidden_channels),
-            nn.GELU(),
-            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(hidden_channels),
-            nn.GELU(),
-            nn.Conv3d(hidden_channels, 3, kernel_size=3, padding=1),
-        )
-
-    def forward(
-        self,
-        source_features: torch.Tensor,
-        target_features: torch.Tensor,
-        raw_displacement: torch.Tensor,
-        confidence: torch.Tensor,
-        entropy: torch.Tensor,
-        extra_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        inputs = [source_features, target_features, raw_displacement, confidence, entropy]
-        if extra_features is not None:
-            inputs.append(extra_features)
-        elif self.extra_channels > 0:
-            inputs.append(
-                source_features.new_zeros(
-                    source_features.shape[0],
-                    self.extra_channels,
-                    *source_features.shape[2:],
-                )
-            )
-        velocity = self.net(torch.cat(inputs, dim=1))
-        velocity = torch.tanh(velocity) * self.max_velocity
-        return torch.nan_to_num(velocity, nan=0.0, posinf=self.max_velocity, neginf=-self.max_velocity)
-
-
-class FinalResidualRefinementHead(nn.Module):
-    def __init__(
-        self,
-        feature_channels: int,
-        hidden_channels: int,
-        max_velocity: float,
-        extra_channels: int = 0,
-        num_blocks: int = 2,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        self.max_velocity = max_velocity
-        in_channels = feature_channels * 2 + 3 + 1 + 1 + extra_channels
-        if activation == "leaky_relu":
-            activation_layer = lambda: nn.LeakyReLU(negative_slope=0.1, inplace=True)
-        elif activation == "gelu":
-            activation_layer = nn.GELU
-        else:
-            raise ValueError(f"Unsupported final refinement activation: {activation}")
-
-        layers: list[nn.Module] = []
-        current_in_channels = in_channels
-        for _ in range(max(1, num_blocks)):
-            layers.extend(
-                [
-                    nn.Conv3d(current_in_channels, hidden_channels, kernel_size=3, padding=1),
-                    nn.InstanceNorm3d(hidden_channels),
-                    activation_layer(),
-                ]
-            )
-            current_in_channels = hidden_channels
-        layers.append(nn.Conv3d(hidden_channels, 3, kernel_size=3, padding=1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(
-        self,
-        source_features: torch.Tensor,
-        target_features: torch.Tensor,
-        displacement: torch.Tensor,
-        confidence: torch.Tensor,
-        entropy: torch.Tensor,
-        extra_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        inputs = [source_features, target_features, displacement, confidence, entropy]
-        if extra_features is not None:
-            inputs.append(extra_features)
-        velocity = self.net(torch.cat(inputs, dim=1))
-        velocity = torch.tanh(velocity) * self.max_velocity
-        return torch.nan_to_num(velocity, nan=0.0, posinf=self.max_velocity, neginf=-self.max_velocity)
-
-
-class ImageErrorEncoder(nn.Module):
-    def __init__(self, out_channels: int, use_edge_inputs: bool) -> None:
-        super().__init__()
-        self.use_edge_inputs = use_edge_inputs
-        in_channels = 3 + (1 if use_edge_inputs else 0)
         self.net = nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.InstanceNorm3d(out_channels),
@@ -141,192 +43,41 @@ class ImageErrorEncoder(nn.Module):
             nn.GELU(),
         )
 
-    @staticmethod
-    def _gradient_magnitude(image: torch.Tensor) -> torch.Tensor:
-        dz = image[:, :, 1:, :, :] - image[:, :, :-1, :, :]
-        dy = image[:, :, :, 1:, :] - image[:, :, :, :-1, :]
-        dx = image[:, :, :, :, 1:] - image[:, :, :, :, :-1]
-
-        grad = image.new_zeros(image.shape)
-        grad[:, :, 1:, :, :] += dz.abs()
-        grad[:, :, :-1, :, :] += dz.abs()
-        grad[:, :, :, 1:, :] += dy.abs()
-        grad[:, :, :, :-1, :] += dy.abs()
-        grad[:, :, :, :, 1:] += dx.abs()
-        grad[:, :, :, :, :-1] += dx.abs()
-        return grad
-
-    def forward(self, moved_source: torch.Tensor, target_image: torch.Tensor) -> torch.Tensor:
-        abs_diff = (moved_source - target_image).abs()
-        inputs = [moved_source, target_image, abs_diff]
-        if self.use_edge_inputs:
-            edge_diff = (self._gradient_magnitude(moved_source) - self._gradient_magnitude(target_image)).abs()
-            inputs.append(edge_diff)
-        return self.net(torch.cat(inputs, dim=1))
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(self.net(features), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-@dataclass
-class LocalResidualMatchOutputs:
-    delta_displacement: torch.Tensor
-    confidence: torch.Tensor
-    margin: torch.Tensor
-    entropy: torch.Tensor
-    encoded_features: torch.Tensor
-
-
-class LocalResidualMatcher(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        radius: int,
-        proj_channels: int,
-        out_channels: int,
-        temperature: float = 1.0,
-    ) -> None:
+class StructuredEvidenceVelocityAdapter(nn.Module):
+    def __init__(self, evidence_channels: int, hidden_channels: int, max_velocity: float) -> None:
         super().__init__()
-        self.radius = radius
-        self.temperature = temperature
-        self.proj_source = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
-        self.proj_target = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
-        offsets = [
-            (dz, dy, dx)
-            for dz in range(-radius, radius + 1)
-            for dy in range(-radius, radius + 1)
-            for dx in range(-radius, radius + 1)
-        ]
-        self.offsets = offsets
-        offset_tensor = torch.tensor(offsets, dtype=torch.float32).view(1, len(offsets), 3, 1, 1, 1)
-        self.register_buffer("offset_tensor", offset_tensor, persistent=False)
-        num_offsets = len(offsets)
-        self.encoder = nn.Sequential(
-            nn.Conv3d(num_offsets + 3 + 1 + 1, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(out_channels),
+        self.max_velocity = max_velocity
+        self.net = nn.Sequential(
+            nn.Conv3d(evidence_channels + 3 + 1 + 1, hidden_channels, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(hidden_channels),
             nn.GELU(),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(out_channels),
-            nn.GELU(),
+            nn.Conv3d(hidden_channels, 3, kernel_size=3, padding=1),
         )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(
         self,
-        source_features: torch.Tensor,
-        warped_target_features: torch.Tensor,
-    ) -> LocalResidualMatchOutputs:
-        source_proj = F.normalize(self.proj_source(source_features), dim=1)
-        target_proj = F.normalize(self.proj_target(warped_target_features), dim=1)
-
-        radius = self.radius
-        padded_target = F.pad(target_proj, (radius, radius, radius, radius, radius, radius), mode="replicate")
-        correlations = []
-        for dz, dy, dx in self.offsets:
-            shifted = padded_target[
-                :,
-                :,
-                radius + dz : radius + dz + source_proj.shape[2],
-                radius + dy : radius + dy + source_proj.shape[3],
-                radius + dx : radius + dx + source_proj.shape[4],
-            ]
-            correlations.append((source_proj * shifted).sum(dim=1, keepdim=True))
-
-        correlation_volume = torch.cat(correlations, dim=1)
-        probabilities = F.softmax(correlation_volume / max(self.temperature, 1e-6), dim=1)
-        probabilities = torch.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
-        expected_offset = (probabilities.unsqueeze(2) * self.offset_tensor).sum(dim=1)
-        expected_offset = torch.nan_to_num(expected_offset, nan=0.0, posinf=0.0, neginf=0.0)
-        confidence = probabilities.max(dim=1, keepdim=True).values
-        top2 = probabilities.topk(k=min(2, probabilities.shape[1]), dim=1).values
-        if top2.shape[1] > 1:
-            margin = top2[:, :1] - top2[:, 1:2]
-        else:
-            margin = top2[:, :1]
-        margin = torch.nan_to_num(margin, nan=0.0, posinf=0.0, neginf=0.0)
-        entropy = softmax_entropy(probabilities, dim=1).unsqueeze(1)
-        entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
-        encoded_features = self.encoder(torch.cat([correlation_volume, expected_offset, confidence, entropy], dim=1))
-        encoded_features = torch.nan_to_num(encoded_features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return LocalResidualMatchOutputs(
-            delta_displacement=expected_offset,
-            confidence=confidence,
-            margin=margin,
-            entropy=entropy,
-            encoded_features=encoded_features,
-        )
+        evidence: torch.Tensor,
+        raw_displacement: torch.Tensor,
+        confidence: torch.Tensor,
+        entropy: torch.Tensor,
+    ) -> torch.Tensor:
+        velocity = self.net(torch.cat([evidence, raw_displacement, confidence, entropy], dim=1))
+        velocity = torch.tanh(velocity) * self.max_velocity
+        return torch.nan_to_num(velocity, nan=0.0, posinf=self.max_velocity, neginf=-self.max_velocity)
 
 
-class StageLocalCorrelationRefiner(LocalResidualMatcher):
-    """Lightweight mid-resolution local search around the current warped position."""
+class DiffeomorphicRegistrationDecoderV6(nn.Module):
+    """
+    v6 decoder: keep the existing coarse diffeomorphic backbone, but extend
+    explicit correspondence handoff to stage 0 with propagated-confidence gating.
+    """
 
-
-class LocalCostVolumeEncoder(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        radius: int,
-        proj_channels: int,
-        out_channels: int,
-    ) -> None:
-        super().__init__()
-        self.radius = radius
-        self.proj_source = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
-        self.proj_target = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
-        num_offsets = (2 * radius + 1) ** 3
-        self.offsets = [
-            (dz, dy, dx)
-            for dz in range(-radius, radius + 1)
-            for dy in range(-radius, radius + 1)
-            for dx in range(-radius, radius + 1)
-        ]
-        self.encoder = nn.Sequential(
-            nn.Conv3d(num_offsets + 3, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(out_channels),
-            nn.GELU(),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm3d(out_channels),
-            nn.GELU(),
-        )
-
-    def forward(self, source_features: torch.Tensor, warped_target_features: torch.Tensor) -> torch.Tensor:
-        source_proj = F.normalize(self.proj_source(source_features), dim=1)
-        target_proj = F.normalize(self.proj_target(warped_target_features), dim=1)
-
-        radius = self.radius
-        padded_target = F.pad(target_proj, (radius, radius, radius, radius, radius, radius), mode="replicate")
-        correlations = []
-        weights = []
-        for dz, dy, dx in self.offsets:
-            shifted = padded_target[
-                :,
-                :,
-                radius + dz : radius + dz + source_proj.shape[2],
-                radius + dy : radius + dy + source_proj.shape[3],
-                radius + dx : radius + dx + source_proj.shape[4],
-            ]
-            correlation = (source_proj * shifted).sum(dim=1, keepdim=True)
-            correlations.append(correlation)
-            weights.append(correlation)
-
-        correlation_volume = torch.cat(correlations, dim=1)
-        weight_volume = F.softmax(correlation_volume, dim=1)
-        offset_tensor = source_proj.new_tensor(self.offsets).view(1, len(self.offsets), 3, 1, 1, 1)
-        expected_offset = (weight_volume.unsqueeze(2) * offset_tensor).sum(dim=1)
-        return self.encoder(torch.cat([correlation_volume, expected_offset], dim=1))
-
-
-@dataclass
-class DecoderOutputs:
-    displacement: torch.Tensor
-    moved_source: torch.Tensor
-    stage_displacements: dict[int, torch.Tensor]
-    stage_velocity_fields: dict[int, torch.Tensor]
-    stage_target_displacements: dict[int, torch.Tensor]
-    stage_target_confidences: dict[int, torch.Tensor]
-    stage_target_margins: dict[int, torch.Tensor]
-    stage_target_entropies: dict[int, torch.Tensor]
-    final_residual_velocity: torch.Tensor | None
-
-
-class DiffeomorphicRegistrationDecoder(nn.Module):
     def __init__(
         self,
         stage_channels: list[int],
@@ -359,6 +110,18 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
         stage1_local_refinement_proj_channels: int = 16,
         stage1_local_refinement_feature_channels: int = 16,
         stage1_local_refinement_temperature: float = 1.0,
+        use_stage0_local_refinement: bool = False,
+        stage0_local_refinement_radius: int = 0,
+        stage0_local_refinement_proj_channels: int = 16,
+        stage0_local_refinement_feature_channels: int = 16,
+        stage0_local_refinement_temperature: float = 1.0,
+        stage_local_refinement_gate_with_prior: bool = True,
+        stage_local_refinement_prior_confidence_power: float = 0.5,
+        use_structured_match_handoff: bool = False,
+        structured_match_handoff_topm: int = 2,
+        structured_match_handoff_channels: int = 16,
+        structured_match_adapter_hidden_channels: int = 32,
+        structured_match_adapter_velocity_scale: float = 0.25,
         diagnostic_residual_only: bool = False,
     ) -> None:
         super().__init__()
@@ -381,19 +144,73 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
             and final_refinement_local_matcher_radius > 0
         )
         self.use_stage1_local_refinement = use_stage1_local_refinement and stage1_local_refinement_radius > 0
+        self.use_stage0_local_refinement = use_stage0_local_refinement and stage0_local_refinement_radius > 0
+        self.stage_local_refinement_gate_with_prior = stage_local_refinement_gate_with_prior
+        self.stage_local_refinement_prior_confidence_power = stage_local_refinement_prior_confidence_power
+        self.use_structured_match_handoff = (
+            use_structured_match_handoff and structured_match_handoff_topm > 0 and structured_match_handoff_channels > 0
+        )
+        self.structured_match_handoff_topm = structured_match_handoff_topm
+        self.structured_match_handoff_channels = structured_match_handoff_channels
+        self.structured_match_handoff_input_channels = structured_match_handoff_topm * 4 + 6
+        self.structured_match_adapter_hidden_channels = structured_match_adapter_hidden_channels
+        self.structured_match_adapter_velocity_scale = structured_match_adapter_velocity_scale
 
         self.stage_decoders = nn.ModuleDict()
         self.integrators = nn.ModuleDict()
         self.transformers = nn.ModuleDict()
+        self.stage_local_refiners = nn.ModuleDict()
+        self.stage_match_evidence_encoders = nn.ModuleDict()
+        self.stage_structured_adapters = nn.ModuleDict()
+        self.stage_local_feature_channels: dict[int, int] = {}
 
         stage_sizes = self._stage_sizes(image_size, len(stage_channels))
+        local_refinement_specs = {
+            1: (
+                self.use_stage1_local_refinement,
+                stage1_local_refinement_radius,
+                stage1_local_refinement_proj_channels,
+                stage1_local_refinement_feature_channels,
+                stage1_local_refinement_temperature,
+            ),
+            0: (
+                self.use_stage0_local_refinement,
+                stage0_local_refinement_radius,
+                stage0_local_refinement_proj_channels,
+                stage0_local_refinement_feature_channels,
+                stage0_local_refinement_temperature,
+            ),
+        }
         for stage_id in decoder_stage_ids:
             size = tuple(stage_sizes[stage_id])
-            extra_channels = (
-                stage1_local_refinement_feature_channels
-                if self.use_stage1_local_refinement and stage_id == 1
-                else 0
+            extra_channels = 0
+            if self.use_structured_match_handoff:
+                self.stage_match_evidence_encoders[str(stage_id)] = StructuredMatchEvidenceEncoder(
+                    in_channels=self.structured_match_handoff_input_channels,
+                    out_channels=self.structured_match_handoff_channels,
+                )
+                self.stage_structured_adapters[str(stage_id)] = StructuredEvidenceVelocityAdapter(
+                    evidence_channels=self.structured_match_handoff_channels,
+                    hidden_channels=self.structured_match_adapter_hidden_channels,
+                    max_velocity=max_velocity * self.structured_match_adapter_velocity_scale,
+                )
+            enabled, radius, proj_channels, feature_channels, temperature = local_refinement_specs.get(
+                stage_id,
+                (False, 0, 16, 16, 1.0),
             )
+            if enabled:
+                self.stage_local_refiners[str(stage_id)] = StageLocalCorrelationRefiner(
+                    in_channels=stage_channels[stage_id],
+                    radius=radius,
+                    proj_channels=proj_channels,
+                    out_channels=feature_channels,
+                    temperature=temperature,
+                )
+                self.stage_local_feature_channels[stage_id] = feature_channels
+                # Encoded local match features plus two scalar channels:
+                # confidence gate and propagated prior confidence.
+                extra_channels += feature_channels + 2
+
             self.stage_decoders[str(stage_id)] = StageVelocityDecoder(
                 feature_channels=stage_channels[stage_id],
                 hidden_channels=hidden_channels,
@@ -402,14 +219,6 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
             )
             self.integrators[str(stage_id)] = ScalingAndSquaring(size=size, steps=integration_steps)
             self.transformers[str(stage_id)] = SpatialTransformer(size=size)
-        if self.use_stage1_local_refinement:
-            self.stage1_local_refiner = StageLocalCorrelationRefiner(
-                in_channels=stage_channels[1],
-                radius=stage1_local_refinement_radius,
-                proj_channels=stage1_local_refinement_proj_channels,
-                out_channels=stage1_local_refinement_feature_channels,
-                temperature=stage1_local_refinement_temperature,
-            )
 
         self.final_transformer = SpatialTransformer(self.image_size)
         self.final_feature_transformer = SpatialTransformer(self.image_size)
@@ -452,6 +261,12 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 size=self.image_size,
                 steps=integration_steps,
             )
+            if self.use_structured_match_handoff:
+                self.final_structured_adapter = StructuredEvidenceVelocityAdapter(
+                    evidence_channels=self.structured_match_handoff_channels,
+                    hidden_channels=self.structured_match_adapter_hidden_channels,
+                    max_velocity=final_refinement_max_velocity * self.structured_match_adapter_velocity_scale,
+                )
 
     @staticmethod
     def _stage_sizes(image_size: list[int], num_stages: int) -> list[list[int]]:
@@ -470,9 +285,124 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
         abs_diff = (moved_source - target_image).abs()
         inputs = [moved_source, target_image, abs_diff]
         if use_edge_inputs:
-            edge_diff = (ImageErrorEncoder._gradient_magnitude(moved_source) - ImageErrorEncoder._gradient_magnitude(target_image)).abs()
+            edge_diff = (
+                ImageErrorEncoder._gradient_magnitude(moved_source)
+                - ImageErrorEncoder._gradient_magnitude(target_image)
+            ).abs()
             inputs.append(edge_diff)
         return torch.cat(inputs, dim=1)
+
+    def _build_local_refinement_context(
+        self,
+        stage_id: int,
+        source_stage: torch.Tensor,
+        warped_target: torch.Tensor,
+        previous_displacement: torch.Tensor,
+        previous_confidence: torch.Tensor | None,
+        transformer: SpatialTransformer,
+    ) -> _LocalRefinementContext:
+        local_refiner = self.stage_local_refiners[str(stage_id)]
+        local_outputs = local_refiner(source_stage, warped_target)
+
+        if previous_confidence is None:
+            propagated_confidence = local_outputs.confidence.new_ones(local_outputs.confidence.shape)
+        else:
+            propagated_confidence = F.interpolate(
+                previous_confidence,
+                size=local_outputs.confidence.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+        propagated_confidence = torch.nan_to_num(propagated_confidence, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.stage_local_refinement_gate_with_prior:
+            confidence_gate = local_outputs.confidence * propagated_confidence.clamp_min(1e-6).pow(
+                self.stage_local_refinement_prior_confidence_power
+            )
+        else:
+            confidence_gate = local_outputs.confidence
+        confidence_gate = confidence_gate.clamp(0.0, 1.0)
+
+        raw_displacement = local_outputs.delta_displacement * confidence_gate
+        target_displacement = compose_displacement_fields(
+            previous_displacement,
+            raw_displacement,
+            transformer,
+        )
+        local_features = torch.cat(
+            [
+                local_outputs.encoded_features * confidence_gate,
+                confidence_gate,
+                propagated_confidence,
+            ],
+            dim=1,
+        )
+        return _LocalRefinementContext(
+            raw_displacement=torch.nan_to_num(raw_displacement, nan=0.0, posinf=0.0, neginf=0.0),
+            confidence=confidence_gate,
+            margin=local_outputs.margin,
+            entropy=local_outputs.entropy,
+            target_displacement=torch.nan_to_num(target_displacement, nan=0.0, posinf=0.0, neginf=0.0),
+            extra_features=torch.nan_to_num(local_features, nan=0.0, posinf=0.0, neginf=0.0),
+        )
+
+    def _encode_stage_match_evidence(self, stage_id: int, stage_match: object) -> torch.Tensor | None:
+        if not self.use_structured_match_handoff:
+            return None
+        raw_features = getattr(stage_match, "structured_handoff_features", None)
+        if raw_features is None:
+            return None
+        return self.stage_match_evidence_encoders[str(stage_id)](raw_features)
+
+    def _select_final_confidence(
+        self,
+        stage_target_confidences: dict[int, torch.Tensor],
+        stage_target_entropies: dict[int, torch.Tensor],
+        batch_size: int,
+        feature_shape: tuple[int, int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+        oracle_dense_displacement: torch.Tensor | None,
+        match_outputs: dict[int, object],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if oracle_dense_displacement is not None:
+            confidence = torch.ones((batch_size, 1, *self.image_size), device=device, dtype=dtype)
+            entropy = torch.zeros((batch_size, 1, *self.image_size), device=device, dtype=dtype)
+            return confidence, entropy
+
+        if stage_target_confidences:
+            finest_stage = min(stage_target_confidences)
+            confidence = F.interpolate(
+                stage_target_confidences[finest_stage],
+                size=self.image_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+            entropy = F.interpolate(
+                stage_target_entropies[finest_stage],
+                size=self.image_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+            return confidence, entropy
+
+        match_stage_id = min(match_outputs) if match_outputs else None
+        if match_stage_id is not None:
+            confidence = F.interpolate(
+                match_outputs[match_stage_id].confidence,
+                size=self.image_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+            entropy = F.interpolate(
+                match_outputs[match_stage_id].entropy,
+                size=self.image_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+            return confidence, entropy
+
+        zeros = torch.zeros((batch_size, 1, *feature_shape), device=device, dtype=dtype)
+        return zeros, zeros
 
     def forward(
         self,
@@ -484,6 +414,8 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
         oracle_dense_displacement: torch.Tensor | None = None,
     ) -> DecoderOutputs:
         previous_displacement = None
+        previous_confidence = None
+        previous_structured_evidence = None
         stage_displacements: dict[int, torch.Tensor] = {}
         stage_velocity_fields: dict[int, torch.Tensor] = {}
         stage_target_displacements: dict[int, torch.Tensor] = {}
@@ -499,9 +431,24 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 stage_size = tuple(source_stage.shape[2:])
                 transformer = self.transformers[str(stage_id)]
                 stage_extra_features = None
+                stage_structured_evidence = None
 
                 if previous_displacement is not None:
                     previous_displacement = resize_displacement(previous_displacement, stage_size)
+                    if previous_confidence is not None:
+                        previous_confidence = F.interpolate(
+                            previous_confidence,
+                            size=stage_size,
+                            mode="trilinear",
+                            align_corners=False,
+                        )
+                    if previous_structured_evidence is not None:
+                        previous_structured_evidence = F.interpolate(
+                            previous_structured_evidence,
+                            size=stage_size,
+                            mode="trilinear",
+                            align_corners=False,
+                        )
                     warped_target = transformer(target_stage, previous_displacement)
                 else:
                     warped_target = target_stage
@@ -525,24 +472,28 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                     confidence = stage_match.confidence
                     margin = stage_match.margin
                     entropy = stage_match.entropy
+                    stage_structured_evidence = self._encode_stage_match_evidence(stage_id, stage_match)
                     stage_target_displacements[stage_id] = stage_match.raw_displacement.detach()
                     stage_target_confidences[stage_id] = confidence.detach()
                     stage_target_margins[stage_id] = margin.detach()
                     stage_target_entropies[stage_id] = entropy.detach()
                     if previous_displacement is not None:
                         raw_displacement = raw_displacement - previous_displacement
-                elif self.use_stage1_local_refinement and stage_id == 1 and previous_displacement is not None:
-                    stage1_local = self.stage1_local_refiner(source_stage, warped_target)
-                    raw_displacement = stage1_local.delta_displacement
-                    confidence = stage1_local.confidence
-                    margin = stage1_local.margin
-                    entropy = stage1_local.entropy
-                    stage_extra_features = stage1_local.encoded_features
-                    stage_target_displacements[stage_id] = compose_displacement_fields(
-                        previous_displacement,
-                        stage1_local.delta_displacement,
-                        transformer,
-                    ).detach()
+                elif previous_displacement is not None and str(stage_id) in self.stage_local_refiners:
+                    local_context = self._build_local_refinement_context(
+                        stage_id=stage_id,
+                        source_stage=source_stage,
+                        warped_target=warped_target,
+                        previous_displacement=previous_displacement,
+                        previous_confidence=previous_confidence,
+                        transformer=transformer,
+                    )
+                    raw_displacement = local_context.raw_displacement
+                    confidence = local_context.confidence
+                    margin = local_context.margin
+                    entropy = local_context.entropy
+                    stage_extra_features = local_context.extra_features
+                    stage_target_displacements[stage_id] = local_context.target_displacement.detach()
                     stage_target_confidences[stage_id] = confidence.detach()
                     stage_target_margins[stage_id] = margin.detach()
                     stage_target_entropies[stage_id] = entropy.detach()
@@ -552,7 +503,10 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                     else:
                         raw_displacement = previous_displacement
                     confidence = source_stage.new_zeros(source_stage.shape[0], 1, *stage_size)
+                    margin = source_stage.new_zeros(source_stage.shape[0], 1, *stage_size)
                     entropy = source_stage.new_zeros(source_stage.shape[0], 1, *stage_size)
+                    if previous_structured_evidence is not None:
+                        stage_extra_features = previous_structured_evidence
 
                 velocity = self.stage_decoders[str(stage_id)](
                     source_stage,
@@ -562,6 +516,16 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                     entropy,
                     extra_features=stage_extra_features,
                 )
+                if self.use_structured_match_handoff:
+                    if stage_structured_evidence is None and previous_structured_evidence is not None:
+                        stage_structured_evidence = previous_structured_evidence
+                    if stage_structured_evidence is not None:
+                        velocity = velocity + self.stage_structured_adapters[str(stage_id)](
+                            evidence=stage_structured_evidence,
+                            raw_displacement=raw_displacement,
+                            confidence=confidence,
+                            entropy=entropy,
+                        )
                 stage_velocity_fields[stage_id] = velocity
                 residual_displacement = self.integrators[str(stage_id)](velocity)
                 residual_displacement = torch.nan_to_num(residual_displacement, nan=0.0, posinf=0.0, neginf=0.0)
@@ -576,6 +540,9 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 current_displacement = torch.nan_to_num(current_displacement, nan=0.0, posinf=0.0, neginf=0.0)
                 stage_displacements[stage_id] = current_displacement
                 previous_displacement = current_displacement
+                previous_confidence = confidence
+                if stage_structured_evidence is not None:
+                    previous_structured_evidence = stage_structured_evidence
 
         if previous_displacement is None:
             batch_size = source_image.shape[0]
@@ -604,26 +571,16 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 entropy = local_match_outputs.entropy
                 extra_features.append(local_match_outputs.encoded_features)
             else:
-                match_stage_id = min(match_outputs) if match_outputs else None
-                if oracle_dense_displacement is not None:
-                    confidence = source_fine.new_ones(source_fine.shape[0], 1, *self.image_size)
-                    entropy = source_fine.new_zeros(source_fine.shape[0], 1, *self.image_size)
-                elif match_stage_id is not None:
-                    confidence = F.interpolate(
-                        match_outputs[match_stage_id].confidence,
-                        size=self.image_size,
-                        mode="trilinear",
-                        align_corners=False,
-                    )
-                    entropy = F.interpolate(
-                        match_outputs[match_stage_id].entropy,
-                        size=self.image_size,
-                        mode="trilinear",
-                        align_corners=False,
-                    )
-                else:
-                    confidence = source_fine.new_zeros(source_fine.shape[0], 1, *self.image_size)
-                    entropy = source_fine.new_zeros(source_fine.shape[0], 1, *self.image_size)
+                confidence, entropy = self._select_final_confidence(
+                    stage_target_confidences=stage_target_confidences,
+                    stage_target_entropies=stage_target_entropies,
+                    batch_size=source_fine.shape[0],
+                    feature_shape=source_fine.shape[2:],
+                    device=source_fine.device,
+                    dtype=source_fine.dtype,
+                    oracle_dense_displacement=oracle_dense_displacement,
+                    match_outputs=match_outputs,
+                )
             if self.final_refinement_include_raw_image_error_inputs:
                 extra_features.append(
                     self._raw_image_error_features(
@@ -644,6 +601,26 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 entropy,
                 extra_features=torch.cat(extra_features, dim=1) if extra_features else None,
             )
+            if self.use_structured_match_handoff:
+                if previous_structured_evidence is None:
+                    final_structured_evidence = source_fine.new_zeros(
+                        source_fine.shape[0],
+                        self.structured_match_handoff_channels,
+                        *source_fine.shape[2:],
+                    )
+                else:
+                    final_structured_evidence = F.interpolate(
+                        previous_structured_evidence,
+                        size=source_fine.shape[2:],
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+                residual_velocity = residual_velocity + self.final_structured_adapter(
+                    evidence=torch.nan_to_num(final_structured_evidence, nan=0.0, posinf=0.0, neginf=0.0),
+                    raw_displacement=final_displacement,
+                    confidence=confidence,
+                    entropy=entropy,
+                )
             final_residual_velocity = residual_velocity
             residual_displacement = self.final_refinement_integrator(residual_velocity)
             residual_displacement = torch.nan_to_num(residual_displacement, nan=0.0, posinf=0.0, neginf=0.0)

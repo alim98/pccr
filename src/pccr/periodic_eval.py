@@ -123,7 +123,8 @@ class IterativeEvalCallback(Callback):
         if dataset_length <= 0:
             return
         pair_index = min(max(self.visualization_pair_index, 0), dataset_length - 1)
-        source, target, source_label, target_label = self.dataset[pair_index]
+        sample = self.dataset[pair_index]
+        source, target, source_label, target_label = sample[:4]
         source = source.unsqueeze(0).to(device)
         target = target.unsqueeze(0).to(device)
         source_label = source_label.unsqueeze(0).to(device)
@@ -178,7 +179,7 @@ class IterativeEvalCallback(Callback):
         records = []
         with torch.no_grad():
             for pair_idx, batch in enumerate(self.loader):
-                source, target, source_label, target_label = [tensor.to(device) for tensor in batch]
+                source, target, source_label, target_label = [tensor.to(device) for tensor in batch[:4]]
                 before = identity_metrics(
                     source_label=source_label,
                     target_label=target_label,

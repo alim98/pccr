@@ -1,0 +1,63 @@
+data_size:
+  - 40
+  - 48
+  - 56
+in_channels: 1
+stage_channels:
+  - 32
+  - 64
+  - 128
+  - 256
+kernel_size: 3
+descriptor_dim: 32
+context_dim: 128
+matcher_temperature: 0.07
+matcher_topk: 24
+canonical_radius: 0.45
+pointmap_stage_ids:
+  - 2
+  - 3
+decoder_stage_ids:
+  - 3
+  - 2
+  - 1
+  - 0
+svf_integration_steps: 7
+decoder_channels: 64
+max_velocity: 1.0
+num_matchability_classes: 3
+use_fine_local_refinement: true
+use_final_residual_refinement: true
+final_refinement_hidden_channels: 64
+final_refinement_max_velocity: 0.2
+final_refinement_use_image_error_inputs: true
+final_refinement_image_error_channels: 16
+final_refinement_use_error_edges: true
+final_refinement_use_local_cost_volume: true
+final_refinement_cost_volume_radius: 2
+final_refinement_cost_volume_proj_channels: 16
+final_refinement_cost_volume_feature_channels: 16
+image_loss: lncc
+multiscale_similarity_factors: [1]
+multiscale_similarity_weights: [1.0]
+image_loss_weight: 1.0
+segmentation_supervision_weight: 0.0
+smoothness_weight: 0.0
+jacobian_weight: 0.0
+inverse_consistency_weight: 0.0
+correspondence_weight: 0.0
+residual_velocity_weight: 0.0
+matchability_score_mode: soft
+matchability_score_power: 0.5
+refinement_warmup_epochs: 0
+encoder_lr_scale: 1.0
+canonical_head_lr_scale: 1.0
+coarse_decoder_lr_scale: 1.0
+residual_refinement_lr_scale: 1.5
+synthetic_warp_scale: 2.5
+synthetic_control_grid:
+  - 5
+  - 6
+  - 7
+phase: real
+num_labels: 86

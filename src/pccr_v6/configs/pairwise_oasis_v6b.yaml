@@ -1,0 +1,94 @@
+data_size:
+  - 40
+  - 48
+  - 56
+in_channels: 1
+stage_channels:
+  - 32
+  - 64
+  - 128
+  - 256
+kernel_size: 3
+descriptor_dim: 32
+context_dim: 128
+matcher_temperature: 0.07
+matcher_topk: 24
+canonical_radius: 0.45
+matcher_type: candidate_structured
+matcher_confidence_mode: margin
+refined_matcher_hidden_dim: 64
+refined_matcher_offset_scale: 0.5
+refined_matcher_output_mode: topm_reweighted
+refined_matcher_topm: 2
+use_structured_match_handoff: true
+structured_match_handoff_topm: 2
+structured_match_handoff_channels: 16
+structured_match_adapter_hidden_channels: 32
+structured_match_adapter_velocity_scale: 0.25
+pointmap_stage_ids:
+  - 2
+  - 3
+decoder_stage_ids:
+  - 3
+  - 2
+  - 1
+  - 0
+svf_integration_steps: 7
+decoder_channels: 64
+max_velocity: 1.0
+num_matchability_classes: 3
+use_fine_local_refinement: true
+use_stage1_local_refinement: true
+stage1_local_refinement_radius: 2
+stage1_local_refinement_proj_channels: 16
+stage1_local_refinement_feature_channels: 16
+stage1_local_refinement_temperature: 1.0
+use_stage0_local_refinement: true
+stage0_local_refinement_radius: 1
+stage0_local_refinement_proj_channels: 16
+stage0_local_refinement_feature_channels: 16
+stage0_local_refinement_temperature: 1.0
+stage_local_refinement_gate_with_prior: true
+stage_local_refinement_prior_confidence_power: 0.5
+use_final_residual_refinement: true
+final_refinement_hidden_channels: 48
+final_refinement_max_velocity: 0.2
+final_refinement_num_blocks: 3
+final_refinement_activation: leaky_relu
+final_refinement_use_image_error_inputs: false
+final_refinement_include_raw_image_error_inputs: true
+final_refinement_image_error_channels: 16
+final_refinement_use_error_edges: false
+final_refinement_use_local_cost_volume: false
+final_refinement_use_local_residual_matcher: false
+image_loss: lncc
+multiscale_similarity_factors: [1, 2]
+multiscale_similarity_weights: [1.0, 0.25]
+image_loss_weight: 1.25
+segmentation_supervision_weight: 0.0
+smoothness_weight: 0.01
+jacobian_weight: 0.005
+inverse_consistency_weight: 0.05
+correspondence_weight: 0.2
+decoder_fitting_weight: 0.1
+decoder_fitting_detach_target: true
+decoder_fitting_entropy_threshold: 0.9
+decoder_fitting_confidence_percentile: 0.5
+decoder_fitting_margin_power: 0.0
+decoder_fitting_margin_min: 0.0
+residual_velocity_weight: 0.0
+matchability_score_mode: soft
+matchability_score_power: 0.5
+synthetic_refresh_required: false
+refinement_warmup_epochs: 0
+encoder_lr_scale: 1.0
+canonical_head_lr_scale: 1.0
+coarse_decoder_lr_scale: 1.0
+residual_refinement_lr_scale: 1.5
+synthetic_warp_scale: 2.5
+synthetic_control_grid:
+  - 5
+  - 6
+  - 7
+phase: real
+num_labels: 86

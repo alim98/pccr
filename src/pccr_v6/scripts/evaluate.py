@@ -11,8 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from src.pccr.config import PCCRConfig
-from src.pccr.data import create_real_pair_dataloaders
+from src.pccr.data import create_overfit_pair_dataloaders, create_real_pair_dataloaders
 from src.pccr.eval_utils import (
     aggregate_metrics,
     identity_metrics,
@@ -21,12 +20,13 @@ from src.pccr.eval_utils import (
     prefix_metrics,
     save_metrics_report,
 )
-from src.pccr.trainer import LiTPCCR
+from src.pccr_v6.config import PCCRV6Config
+from src.pccr_v6.trainer import LiTPCCRV6
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a trained PCCR checkpoint.")
-    parser.add_argument("--config", type=str, default="src/pccr/configs/pairwise_oasis.yaml")
+    parser = argparse.ArgumentParser(description="Evaluate a trained PCCR v6 checkpoint.")
+    parser.add_argument("--config", type=str, default="src/pccr_v6/configs/pairwise_oasis_v6a.yaml")
     parser.add_argument("--config_override", action="append", default=[])
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--train_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
@@ -43,8 +43,10 @@ def parse_args():
     parser.add_argument("--max_train_subjects", type=int, default=0)
     parser.add_argument("--max_val_subjects", type=int, default=0)
     parser.add_argument("--max_val_pairs", type=int, default=20)
+    parser.add_argument("--overfit_num_pairs", type=int, default=0)
+    parser.add_argument("--overfit_split", choices=["train", "val"], default="val")
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--experiment_name", type=str, default="pccr_eval")
+    parser.add_argument("--experiment_name", type=str, default="pccr_v6_eval")
     parser.add_argument("--progress_every", type=int, default=25)
     parser.add_argument("--skip_hd95", action="store_true")
     parser.add_argument("--shard_index", type=int, default=0)
@@ -60,7 +62,7 @@ def resolve_device(args) -> torch.device:
     return torch.device("cpu")
 
 
-def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCCRConfig:
+def apply_config_overrides(config: PCCRV6Config, override_items: list[str]) -> PCCRV6Config:
     if not override_items:
         return config
 
@@ -73,6 +75,41 @@ def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCC
     return config.apply_overrides(overrides)
 
 
+def build_eval_loader(args, config: PCCRV6Config) -> tuple[DataLoader, list[int]]:
+    if args.overfit_num_pairs > 0:
+        _, val_loader = create_overfit_pair_dataloaders(args, config)
+        dataset_num_labels = getattr(val_loader.dataset, "num_labels", 0) or 0
+        if dataset_num_labels:
+            config.num_labels = max(config.num_labels, dataset_num_labels)
+        shard_indices = list(range(len(val_loader.dataset)))[args.shard_index :: args.num_shards]
+        shard_dataset = Subset(val_loader.dataset, shard_indices)
+        return (
+            DataLoader(
+                shard_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+            ),
+            shard_indices,
+        )
+
+    _, val_loader = create_real_pair_dataloaders(args, config)
+    dataset_num_labels = getattr(val_loader.dataset, "num_labels", 0) or 0
+    if dataset_num_labels:
+        config.num_labels = max(config.num_labels, dataset_num_labels)
+    shard_indices = list(range(len(val_loader.dataset)))[args.shard_index :: args.num_shards]
+    shard_dataset = Subset(val_loader.dataset, shard_indices)
+    return (
+        DataLoader(
+            shard_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        ),
+        shard_indices,
+    )
+
+
 def main():
     args = parse_args()
     torch.set_float32_matmul_precision("high")
@@ -81,28 +118,13 @@ def main():
     if not (0 <= args.shard_index < args.num_shards):
         raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
 
-    config = apply_config_overrides(PCCRConfig.from_yaml(args.config), args.config_override)
+    config = apply_config_overrides(PCCRV6Config.from_yaml(args.config), args.config_override)
     config.phase = "real"
-
-    _, val_loader = create_real_pair_dataloaders(args, config)
-    dataset_num_labels = getattr(val_loader.dataset, "num_labels", 0) or 0
-    if dataset_num_labels:
-        config.num_labels = max(config.num_labels, dataset_num_labels)
-
-    shard_indices = list(range(len(val_loader.dataset)))[args.shard_index :: args.num_shards]
+    val_loader, shard_indices = build_eval_loader(args, config)
     if not shard_indices:
-        raise ValueError(
-            f"Shard {args.shard_index}/{args.num_shards} received no pairs from dataset of size {len(val_loader.dataset)}."
-        )
-    shard_dataset = Subset(val_loader.dataset, shard_indices)
-    val_loader = DataLoader(
-        shard_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
+        raise ValueError(f"Shard {args.shard_index}/{args.num_shards} received no validation pairs.")
 
-    model = LiTPCCR.load_from_checkpoint(
+    model = LiTPCCRV6.load_from_checkpoint(
         args.checkpoint_path,
         args=args,
         config=config,
@@ -125,7 +147,7 @@ def main():
     with torch.no_grad():
         for local_idx, batch in enumerate(val_loader):
             pair_idx = shard_indices[local_idx]
-            source, target, source_label, target_label = [tensor.to(device) for tensor in batch]
+            source, target, source_label, target_label = [tensor.to(device) for tensor in batch[:4]]
             before = identity_metrics(
                 source_label=source_label,
                 target_label=target_label,
@@ -167,7 +189,7 @@ def main():
                 )
 
     summary = aggregate_metrics(records)
-    output_dir = args.output_dir or f"logs/pccr/{args.experiment_name}_eval"
+    output_dir = args.output_dir or f"logs/pccr_v6/{args.experiment_name}_eval"
     summary_path, pairs_path = save_metrics_report(output_dir, summary, records)
 
     print("Evaluation summary:")

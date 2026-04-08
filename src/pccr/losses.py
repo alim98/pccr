@@ -85,6 +85,84 @@ class CorrespondenceConsistencyLoss(nn.Module):
         return reference_tensor.new_tensor(0.0)
 
 
+class DecoderFittingLoss(nn.Module):
+    def __init__(
+        self,
+        detach_target: bool = True,
+        entropy_threshold: float = -1.0,
+        confidence_percentile: float = 0.0,
+        margin_power: float = 0.0,
+        margin_min: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.detach_target = detach_target
+        self.entropy_threshold = entropy_threshold
+        self.confidence_percentile = confidence_percentile
+        self.margin_power = margin_power
+        self.margin_min = margin_min
+
+    def _single_stage(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        confidence: torch.Tensor,
+        entropy: torch.Tensor,
+        margin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.detach_target:
+            target = target.detach()
+        weight = confidence.detach().clamp_min(0.0)
+        if self.entropy_threshold >= 0.0:
+            weight = weight * (entropy.detach() <= self.entropy_threshold).float()
+        if self.confidence_percentile > 0.0:
+            quantile = torch.quantile(
+                confidence.detach().reshape(confidence.shape[0], -1),
+                q=self.confidence_percentile,
+                dim=1,
+                keepdim=True,
+            ).view(confidence.shape[0], 1, 1, 1, 1)
+            weight = weight * (confidence.detach() >= quantile).float()
+        if margin is not None and self.margin_power > 0.0:
+            margin_weight = (margin.detach() - self.margin_min).clamp_min(0.0)
+            margin_weight = margin_weight.pow(self.margin_power)
+            weight = weight * margin_weight
+
+        if weight.sum() <= 0:
+            return predicted.new_tensor(0.0)
+
+        per_voxel = F.smooth_l1_loss(predicted, target, reduction="none")
+        per_voxel = per_voxel.mean(dim=1, keepdim=True)
+        return (per_voxel * weight).sum() / weight.sum().clamp_min(1.0)
+
+    def forward(
+        self,
+        predicted_displacements: dict[int, torch.Tensor],
+        target_displacements: dict[int, torch.Tensor],
+        confidences: dict[int, torch.Tensor],
+        entropies: dict[int, torch.Tensor],
+        margins: dict[int, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        losses = []
+        for stage_id, target in target_displacements.items():
+            if stage_id not in predicted_displacements:
+                continue
+            losses.append(
+                self._single_stage(
+                    predicted=predicted_displacements[stage_id],
+                    target=target,
+                    confidence=confidences[stage_id],
+                    entropy=entropies[stage_id],
+                    margin=margins.get(stage_id) if margins is not None else None,
+                )
+            )
+        if not losses:
+            reference = next(iter(predicted_displacements.values()), None)
+            if reference is None:
+                raise ValueError("DecoderFittingLoss requires at least one predicted stage displacement.")
+            return reference.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+
 @dataclass
 class SyntheticTargets:
     canonical_source: torch.Tensor
@@ -239,6 +317,12 @@ class RegistrationCriterion(nn.Module):
         inverse_consistency_weight: float = 0.1,
         correspondence_weight: float = 0.2,
         residual_velocity_weight: float = 0.0,
+        decoder_fitting_weight: float = 0.0,
+        decoder_fitting_detach_target: bool = True,
+        decoder_fitting_entropy_threshold: float = -1.0,
+        decoder_fitting_confidence_percentile: float = 0.0,
+        decoder_fitting_margin_power: float = 0.0,
+        decoder_fitting_margin_min: float = 0.0,
         num_labels: int = 86,
     ) -> None:
         super().__init__()
@@ -254,6 +338,7 @@ class RegistrationCriterion(nn.Module):
         self.inverse_consistency_weight = inverse_consistency_weight
         self.correspondence_weight = correspondence_weight
         self.residual_velocity_weight = residual_velocity_weight
+        self.decoder_fitting_weight = decoder_fitting_weight
         self.num_labels = num_labels
         self.image_loss = LNCCLoss()
         self.segmentation_loss = DiceLoss(num_class=num_labels)
@@ -261,6 +346,13 @@ class RegistrationCriterion(nn.Module):
         self.jacobian = NegativeJacobianLoss()
         self.inverse_consistency = InverseConsistencyLoss(image_size)
         self.correspondence_consistency = CorrespondenceConsistencyLoss()
+        self.decoder_fitting = DecoderFittingLoss(
+            detach_target=decoder_fitting_detach_target,
+            entropy_threshold=decoder_fitting_entropy_threshold,
+            confidence_percentile=decoder_fitting_confidence_percentile,
+            margin_power=decoder_fitting_margin_power,
+            margin_min=decoder_fitting_margin_min,
+        )
         self.segmentation_transformer = SpatialTransformer(image_size)
         self.synthetic_pointmap = SyntheticPointmapLoss()
         self.synthetic_descriptor = DescriptorContrastiveLoss()
@@ -417,6 +509,20 @@ class RegistrationCriterion(nn.Module):
             model_outputs["forward_matches"],
             model_outputs["backward_matches"],
         )
+        decoder_fitting = self.decoder_fitting(
+            predicted_displacements=model_outputs["forward_stage_displacements"],
+            target_displacements=model_outputs["forward_stage_target_displacements"],
+            confidences=model_outputs["forward_stage_target_confidences"],
+            entropies=model_outputs["forward_stage_target_entropies"],
+            margins=model_outputs.get("forward_stage_target_margins", {}),
+        )
+        decoder_fitting = decoder_fitting + self.decoder_fitting(
+            predicted_displacements=model_outputs["backward_stage_displacements"],
+            target_displacements=model_outputs["backward_stage_target_displacements"],
+            confidences=model_outputs["backward_stage_target_confidences"],
+            entropies=model_outputs["backward_stage_target_entropies"],
+            margins=model_outputs.get("backward_stage_target_margins", {}),
+        )
         residual_velocity = self._residual_velocity_penalty(
             model_outputs.get("forward_final_residual_velocity"),
             model_outputs.get("backward_final_residual_velocity"),
@@ -427,6 +533,7 @@ class RegistrationCriterion(nn.Module):
         jacobian = torch.nan_to_num(jacobian, nan=0.0, posinf=1e3, neginf=0.0)
         inverse = torch.nan_to_num(inverse, nan=0.0, posinf=1e3, neginf=0.0)
         correspondence = torch.nan_to_num(correspondence, nan=0.0, posinf=1e3, neginf=0.0)
+        decoder_fitting = torch.nan_to_num(decoder_fitting, nan=0.0, posinf=1e3, neginf=0.0)
         if residual_velocity is None:
             residual_velocity = forward_disp.new_tensor(0.0)
         residual_velocity = torch.nan_to_num(residual_velocity, nan=0.0, posinf=1e3, neginf=0.0)
@@ -437,6 +544,7 @@ class RegistrationCriterion(nn.Module):
             + self.jacobian_weight * jacobian
             + self.inverse_consistency_weight * inverse
             + self.correspondence_weight * correspondence
+            + self.decoder_fitting_weight * decoder_fitting
             + self.residual_velocity_weight * residual_velocity
         )
         avg = torch.nan_to_num(avg, nan=1e3, posinf=1e3, neginf=1e3)
@@ -447,6 +555,7 @@ class RegistrationCriterion(nn.Module):
             "jacobian": jacobian,
             "inverse": inverse,
             "correspondence": correspondence,
+            "decoder_fitting": decoder_fitting,
             "residual_velocity": residual_velocity,
             "avg_loss": avg,
         }
