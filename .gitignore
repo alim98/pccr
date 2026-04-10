@@ -28,6 +28,6 @@ idea/
 TransMorph_Transformer_for_Medical_Image_Registration
 archive/
 claude/
-jobs/
+# jobs/
 results/
 third_party/
