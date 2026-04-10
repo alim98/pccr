@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 
 import nibabel as nib
@@ -10,28 +11,81 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data.datasets import (
     OASISFolderDataset,
+    OASISL2RDataset,
     OASIS_PklDataset,
+    discover_oasis_l2r_subjects,
     discover_oasis_subjects,
+    infer_dataset_format,
+    load_oasis_l2r_metadata,
     get_dataloader,
     normalize_image,
 )
 from src.model.transformation import SpatialTransformer
+from src.pccr.config import OASIS_L2R_EVAL_LABEL_IDS
 from src.pccr.utils import normalize_grid, voxel_grid
 
 
 class OASISSingleSubjectDataset(Dataset):
-    def __init__(self, data_root: str, input_dim: list[int]) -> None:
-        self.subjects = list(discover_oasis_subjects(Path(data_root)).values())
+    def __init__(self, data_root: str, input_dim: list[int], dataset_variant: str = "default") -> None:
+        data_path = Path(data_root)
+        self.mode = "volume"
         self.input_dim = tuple(input_dim)
+        if dataset_variant == "pkl" or list(data_path.glob("*.pkl")):
+            self.mode = "pkl"
+            self.paths = sorted(data_path.glob("*.pkl"))
+            if not self.paths:
+                raise FileNotFoundError(f"No .pkl subject files found under {data_path}")
+            image, label = self._load_pkl_subject(self.paths[0])
+            self.native_shape = tuple(int(dim) for dim in image.shape)
+            self.eval_label_ids = list(range(1, int(label.max()) + 1))
+            self.num_labels = int(label.max()) + 1
+            return
+        if dataset_variant == "oasis_l2r" or ((data_path / "imagesTr").exists() and (data_path / "labelsTr").exists()):
+            metadata = load_oasis_l2r_metadata(data_path)
+            self.native_shape = tuple(metadata.native_shape)
+            self.eval_label_ids = list(metadata.eval_label_ids)
+            self.subjects = list(discover_oasis_l2r_subjects(data_path).values())
+        else:
+            self.native_shape = tuple(input_dim)
+            self.eval_label_ids = []
+            self.subjects = list(discover_oasis_subjects(data_path).values())
         self.num_labels = max(
             int(np.asarray(nib.load(str(subject.label_path)).dataobj).max())
             for subject in self.subjects
         ) + 1
 
+    @staticmethod
+    def _load_pkl_subject(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        with path.open("rb") as handle:
+            sample = pickle.load(handle)
+        if not isinstance(sample, tuple) or len(sample) != 2:
+            raise ValueError(f"Synthetic pkl base expects (image, label), got {type(sample).__name__} from {path}")
+        image, label = sample
+        return np.asarray(image), np.asarray(label)
+
     def __len__(self) -> int:
+        if self.mode == "pkl":
+            return len(self.paths)
         return len(self.subjects)
 
     def __getitem__(self, index: int):
+        if self.mode == "pkl":
+            image, label = self._load_pkl_subject(self.paths[index])
+            image_tensor = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+            label_tensor = torch.from_numpy(label.astype(np.int64)).unsqueeze(0)
+            image_tensor = F.interpolate(
+                image_tensor.unsqueeze(0),
+                size=self.input_dim,
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            label_tensor = F.interpolate(
+                label_tensor.float().unsqueeze(0),
+                size=self.input_dim,
+                mode="nearest",
+            ).squeeze(0).long()
+            return image_tensor, label_tensor
+
         subject = self.subjects[index]
         image = np.asarray(nib.load(str(subject.image_path)).dataobj)
         label = np.asarray(nib.load(str(subject.label_path)).dataobj)
@@ -59,12 +113,13 @@ class SyntheticOASISPairDataset(Dataset):
         input_dim: list[int],
         warp_scale: float,
         control_grid: list[int],
+        dataset_variant: str = "default",
         num_steps: int | None = None,
         deterministic: bool = False,
         base_seed: int = 0,
     ) -> None:
-        self.base_dataset = OASISSingleSubjectDataset(data_root, input_dim)
-        self.input_dim = tuple(input_dim)
+        self.base_dataset = OASISSingleSubjectDataset(data_root, input_dim, dataset_variant=dataset_variant)
+        self.input_dim = tuple(self.base_dataset.input_dim)
         self.warp_scale = warp_scale
         self.control_grid = tuple(control_grid)
         self.transformer = SpatialTransformer(self.input_dim)
@@ -73,6 +128,8 @@ class SyntheticOASISPairDataset(Dataset):
         self.num_steps = int(num_steps) if num_steps is not None and num_steps > 0 else len(self.base_dataset)
         self.deterministic = deterministic
         self.base_seed = int(base_seed)
+        self.native_shape = getattr(self.base_dataset, "native_shape", self.input_dim)
+        self.eval_label_ids = list(getattr(self.base_dataset, "eval_label_ids", []))
 
     def __len__(self) -> int:
         return self.num_steps
@@ -170,15 +227,62 @@ class SyntheticOASISPairDataset(Dataset):
         )
 
 
+def resolve_dataset_variant(args, config, data_path: str | None = None) -> str:
+    if getattr(config, "dataset_variant", "default") == "oasis_l2r":
+        return "oasis_l2r"
+    requested_format = getattr(args, "dataset_format", "auto")
+    if requested_format != "auto":
+        return requested_format
+    if data_path is not None:
+        return infer_dataset_format(data_path)
+    return "auto"
+
+
+def resolve_data_root(args, config, split: str) -> str:
+    attr_name = "train_data_path" if split == "train" else "val_data_path"
+    requested_path = getattr(args, attr_name)
+    if getattr(config, "dataset_variant", "default") == "oasis_l2r":
+        default_legacy_root = "/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis"
+        if requested_path == default_legacy_root:
+            return str(Path(config.oasis_l2r_data_root).expanduser())
+    return requested_path
+
+
+def _sync_config_with_dataset_metadata(config, *datasets) -> None:
+    native_shape = None
+    eval_label_ids = None
+    dataset_num_labels = 0
+    for dataset in datasets:
+        if dataset is None:
+            continue
+        native_shape = getattr(dataset, "native_shape", native_shape)
+        eval_label_ids = getattr(dataset, "eval_label_ids", eval_label_ids)
+        dataset_num_labels = max(dataset_num_labels, getattr(dataset, "num_labels", 0) or 0)
+
+    should_align_to_native = bool(getattr(config, "align_data_size_to_native_shape", True))
+    if should_align_to_native and native_shape is not None and list(config.data_size) != list(native_shape):
+        print(f"[pccr.data] Aligning config.data_size from {config.data_size} to dataset native shape {list(native_shape)}.")
+        config.data_size = list(native_shape)
+    if eval_label_ids is not None and not config.eval_label_ids:
+        config.eval_label_ids = list(eval_label_ids)
+    if getattr(config, "dataset_variant", "default") == "oasis_l2r" and not config.eval_label_ids:
+        config.eval_label_ids = list(OASIS_L2R_EVAL_LABEL_IDS)
+    if dataset_num_labels:
+        config.num_labels = dataset_num_labels
+
+
 def create_real_pair_dataloaders(args, config):
+    train_data_path = resolve_data_root(args, config, split="train")
+    val_data_path = resolve_data_root(args, config, split="val")
+    dataset_variant = resolve_dataset_variant(args, config, data_path=train_data_path)
     train_loader = get_dataloader(
-        data_path=args.train_data_path,
+        data_path=train_data_path,
         input_dim=config.data_size,
         batch_size=args.batch_size,
         shuffle=True,
         is_pair=False,
         num_workers=args.num_workers,
-        dataset_format=args.dataset_format,
+        dataset_format=dataset_variant,
         split="train",
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
@@ -186,30 +290,35 @@ def create_real_pair_dataloaders(args, config):
         max_subjects=args.max_train_subjects,
     )
     val_loader = get_dataloader(
-        data_path=args.val_data_path,
+        data_path=val_data_path,
         input_dim=config.data_size,
         batch_size=args.batch_size,
         shuffle=False,
         is_pair=True,
         num_workers=args.num_workers,
-        dataset_format=args.dataset_format,
+        dataset_format=dataset_variant,
         split="val",
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
         max_subjects=args.max_val_subjects,
         max_pairs=args.max_val_pairs,
     )
+    _sync_config_with_dataset_metadata(config, train_loader.dataset, val_loader.dataset)
     return train_loader, val_loader
 
 
 def create_synthetic_dataloader(args, config):
+    train_data_path = resolve_data_root(args, config, split="train")
+    dataset_variant = resolve_dataset_variant(args, config, data_path=train_data_path)
     dataset = SyntheticOASISPairDataset(
-        data_root=args.train_data_path,
+        data_root=train_data_path,
         input_dim=config.data_size,
         warp_scale=config.synthetic_warp_scale,
         control_grid=config.synthetic_control_grid,
+        dataset_variant=dataset_variant,
         num_steps=args.train_num_steps,
     )
+    _sync_config_with_dataset_metadata(config, dataset)
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -219,24 +328,31 @@ def create_synthetic_dataloader(args, config):
 
 
 def create_synthetic_pair_dataloaders(args, config):
+    train_data_path = resolve_data_root(args, config, split="train")
+    val_data_path = resolve_data_root(args, config, split="val")
+    train_dataset_variant = resolve_dataset_variant(args, config, data_path=train_data_path)
+    val_dataset_variant = resolve_dataset_variant(args, config, data_path=val_data_path)
     train_dataset = SyntheticOASISPairDataset(
-        data_root=args.train_data_path,
+        data_root=train_data_path,
         input_dim=config.data_size,
         warp_scale=config.synthetic_warp_scale,
         control_grid=config.synthetic_control_grid,
+        dataset_variant=train_dataset_variant,
         num_steps=args.train_num_steps,
         deterministic=False,
     )
     val_steps = args.max_val_pairs if args.max_val_pairs > 0 else min(max(args.train_num_steps // 2, 20), 200)
     val_dataset = SyntheticOASISPairDataset(
-        data_root=args.val_data_path,
+        data_root=val_data_path,
         input_dim=config.data_size,
         warp_scale=config.synthetic_warp_scale,
         control_grid=config.synthetic_control_grid,
+        dataset_variant=val_dataset_variant,
         num_steps=val_steps,
         deterministic=True,
         base_seed=args.split_seed,
     )
+    _sync_config_with_dataset_metadata(config, train_dataset, val_dataset)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -253,6 +369,7 @@ def create_synthetic_pair_dataloaders(args, config):
 
 
 def build_real_pair_dataset(
+    config,
     data_path: str,
     input_dim: list[int],
     dataset_format: str,
@@ -262,7 +379,12 @@ def build_real_pair_dataset(
     max_subjects: int = 0,
     max_pairs: int = 0,
 ):
-    resolved_format = dataset_format if dataset_format != "auto" else "oasis_fs"
+    resolved_format = (
+        getattr(config, "dataset_variant", "default")
+        if getattr(config, "dataset_variant", "default") != "default"
+        else dataset_format
+    )
+    resolved_format = resolved_format if resolved_format != "auto" else infer_dataset_format(data_path)
     if resolved_format == "pkl":
         dataset = OASIS_PklDataset(
             input_dim=input_dim,
@@ -286,12 +408,26 @@ def build_real_pair_dataset(
             max_pairs=max_pairs,
         )
 
+    if resolved_format == "oasis_l2r":
+        return OASISL2RDataset(
+            input_dim=input_dim,
+            data_path=data_path,
+            split=split,
+            is_pair=True,
+            val_fraction=val_fraction,
+            split_seed=split_seed,
+            max_subjects=max_subjects,
+            max_pairs=max_pairs,
+        )
+
     raise ValueError(f"Unsupported dataset format: {dataset_format}")
 
 
 def create_overfit_pair_dataloaders(args, config):
+    val_data_path = resolve_data_root(args, config, split="val")
     dataset = build_real_pair_dataset(
-        data_path=args.val_data_path,
+        config=config,
+        data_path=val_data_path,
         input_dim=config.data_size,
         dataset_format=args.dataset_format,
         split=args.overfit_split,
@@ -300,6 +436,7 @@ def create_overfit_pair_dataloaders(args, config):
         max_subjects=args.max_val_subjects,
         max_pairs=args.overfit_num_pairs,
     )
+    _sync_config_with_dataset_metadata(config, dataset)
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

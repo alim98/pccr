@@ -278,12 +278,20 @@ class MatchabilityClassificationLoss(nn.Module):
     def forward(self, outputs: dict[int, object], matchability_target: torch.Tensor) -> torch.Tensor:
         losses = []
         for _, prediction in outputs.items():
+            if prediction.matchability_logits.shape[1] <= 1:
+                continue
             resized_target = F.interpolate(
                 matchability_target.float(),
                 size=prediction.matchability_logits.shape[2:],
                 mode="nearest",
             ).long().squeeze(1)
-            losses.append(F.cross_entropy(prediction.matchability_logits, resized_target.clamp(min=0, max=2)))
+            max_label = prediction.matchability_logits.shape[1] - 1
+            losses.append(F.cross_entropy(prediction.matchability_logits, resized_target.clamp(min=0, max=max_label)))
+        if not losses:
+            reference = next(iter(outputs.values()), None)
+            if reference is None:
+                raise ValueError("MatchabilityClassificationLoss requires at least one output stage.")
+            return reference.matchability_logits.new_tensor(0.0)
         return torch.stack(losses).mean()
 
 
@@ -311,11 +319,13 @@ class RegistrationCriterion(nn.Module):
         image_loss_weight: float = 1.0,
         multiscale_similarity_factors: list[int] | None = None,
         multiscale_similarity_weights: list[float] | None = None,
+        lncc_window_size: int = 5,
         segmentation_supervision_weight: float = 0.0,
         smoothness_weight: float = 0.02,
         jacobian_weight: float = 0.01,
         inverse_consistency_weight: float = 0.1,
         correspondence_weight: float = 0.2,
+        synthetic_matchability_weight: float = 0.25,
         residual_velocity_weight: float = 0.0,
         decoder_fitting_weight: float = 0.0,
         decoder_fitting_detach_target: bool = True,
@@ -337,10 +347,11 @@ class RegistrationCriterion(nn.Module):
         self.jacobian_weight = jacobian_weight
         self.inverse_consistency_weight = inverse_consistency_weight
         self.correspondence_weight = correspondence_weight
+        self.synthetic_matchability_weight = synthetic_matchability_weight
         self.residual_velocity_weight = residual_velocity_weight
         self.decoder_fitting_weight = decoder_fitting_weight
         self.num_labels = num_labels
-        self.image_loss = LNCCLoss()
+        self.image_loss = LNCCLoss(window_size=lncc_window_size)
         self.segmentation_loss = DiceLoss(num_class=num_labels)
         self.smoothness = Grad3D(penalty="l2")
         self.jacobian = NegativeJacobianLoss()
@@ -478,7 +489,7 @@ class RegistrationCriterion(nn.Module):
                 1.0 * pointmap_loss
                 + 1.0 * matching_loss
                 + 0.25 * descriptor_loss
-                + 0.25 * matchability_loss
+                + self.synthetic_matchability_weight * matchability_loss
                 + 0.1 * uncertainty_loss
             )
             return {

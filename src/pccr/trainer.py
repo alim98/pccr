@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import warnings
 
 import numpy as np
 import torch
@@ -9,6 +10,7 @@ from lightning import LightningModule
 
 from src.loss import DiceScore
 from src.pccr.config import PCCRConfig
+from src.pccr.eval_utils import jacobian_statistics
 from src.pccr.losses import RegistrationCriterion, SyntheticTargets
 from src.pccr.model import PCCRModel
 from src.pccr.utils import voxel_grid
@@ -33,11 +35,13 @@ class LiTPCCR(LightningModule):
             image_loss_weight=config.image_loss_weight,
             multiscale_similarity_factors=config.multiscale_similarity_factors,
             multiscale_similarity_weights=config.multiscale_similarity_weights,
+            lncc_window_size=config.lncc_window_size,
             segmentation_supervision_weight=config.segmentation_supervision_weight,
             smoothness_weight=config.smoothness_weight,
             jacobian_weight=config.jacobian_weight,
             inverse_consistency_weight=config.inverse_consistency_weight,
             correspondence_weight=config.correspondence_weight,
+            synthetic_matchability_weight=config.synthetic_matchability_weight,
             residual_velocity_weight=config.residual_velocity_weight,
             decoder_fitting_weight=config.decoder_fitting_weight,
             decoder_fitting_detach_target=config.decoder_fitting_detach_target,
@@ -314,7 +318,31 @@ class LiTPCCR(LightningModule):
         if self.args.phase != "synthetic":
             score = self._dice_from_outputs(outputs, source_label, target_label)
             self.log("val_dice", score.mean(), prog_bar=True, on_step=False, on_epoch=True)
+            jacobian_metrics = jacobian_statistics(outputs["phi_s2t"])
+            self.log("val_sdlogj", jacobian_metrics["sdlogj"], prog_bar=False, on_step=False, on_epoch=True)
+            self.log(
+                "val_nonpositive_jacobian_fraction",
+                jacobian_metrics["jacobian_nonpositive_fraction"],
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
+            self.log(
+                "val_nonpositive_jacobian_percent",
+                jacobian_metrics["jacobian_nonpositive_fraction"] * 100.0,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
             self._log_metrics({"val_dice": score.mean()}, step=self.global_step)
+            self._log_metrics(
+                {
+                    "val_sdlogj": jacobian_metrics["sdlogj"],
+                    "val_nonpositive_jacobian_fraction": jacobian_metrics["jacobian_nonpositive_fraction"],
+                    "val_nonpositive_jacobian_percent": jacobian_metrics["jacobian_nonpositive_fraction"] * 100.0,
+                },
+                step=self.global_step,
+            )
 
         self._log_metrics({f"val_{k}": v for k, v in losses.items()}, step=self.global_step)
         return losses["avg_loss"]
@@ -347,7 +375,13 @@ class LiTPCCR(LightningModule):
                 )
             )
         warped_seg = torch.cat(warped_channels, dim=1)
-        return DiceScore(warped_seg, target_label.long(), self.config.num_labels)
+        score = DiceScore(warped_seg, target_label.long(), self.config.num_labels)
+        eval_label_ids = [label_id for label_id in self.config.eval_label_ids if 0 <= label_id < self.config.num_labels]
+        if eval_label_ids:
+            return score[:, eval_label_ids]
+        if score.shape[1] > 1:
+            return score[:, 1:]
+        return score
 
     def configure_optimizers(self):
         parameter_groups = {
@@ -382,10 +416,24 @@ class LiTPCCR(LightningModule):
 
         optimizer_groups = [group for group in parameter_groups.values() if group["params"]]
         optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(self.args.max_epochs, 1),
-        )
+        warmup_epochs = max(int(getattr(self.config, "lr_warmup_epochs", 0)), 0)
+        total_epochs = max(int(self.args.max_epochs), 1)
+        min_ratio = float(getattr(self.config, "lr_min_ratio", 0.0))
+        scheduler_type = getattr(self.config, "lr_scheduler", "cosine")
+
+        if scheduler_type != "cosine":
+            raise ValueError(f"Unsupported lr_scheduler: {scheduler_type}")
+
+        def lr_lambda(epoch: int) -> float:
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                return max((epoch + 1) / warmup_epochs, 1e-8)
+
+            cosine_span = max(total_epochs - warmup_epochs, 1)
+            progress = min(max((epoch - warmup_epochs) / cosine_span, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -404,6 +452,22 @@ class LiTPCCR(LightningModule):
         return dict(vars(args))
 
     @classmethod
+    def _remap_legacy_checkpoint_keys(cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        remapped = dict(state_dict)
+        legacy_prefixes = {
+            "model.decoder.stage1_local_refiner.": "model.decoder.stage_local_refiners.1.",
+            "model.decoder.stage2_local_refiner.": "model.decoder.stage_local_refiners.2.",
+        }
+        for legacy_prefix, new_prefix in legacy_prefixes.items():
+            for key in list(remapped.keys()):
+                if not key.startswith(legacy_prefix):
+                    continue
+                new_key = new_prefix + key[len(legacy_prefix) :]
+                value = remapped.pop(key)
+                remapped.setdefault(new_key, value)
+        return remapped
+
+    @classmethod
     def load_from_checkpoint(
         cls,
         checkpoint_path,
@@ -412,7 +476,13 @@ class LiTPCCR(LightningModule):
         experiment_logger=None,
         strict: bool = True,
     ):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="You are using `torch.load` with `weights_only=False`",
+                category=FutureWarning,
+            )
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         hyper_parameters = checkpoint.get("hyper_parameters", {})
 
         if args is None:
@@ -421,7 +491,7 @@ class LiTPCCR(LightningModule):
             config = PCCRConfig(**hyper_parameters.get("config", {}))
 
         model = cls(args=args, config=config, experiment_logger=experiment_logger)
-        state_dict = checkpoint["state_dict"]
+        state_dict = cls._remap_legacy_checkpoint_keys(checkpoint["state_dict"])
         if strict:
             model.load_state_dict(state_dict, strict=True)
             return model

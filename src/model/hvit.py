@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 import lightning as L
 
@@ -332,12 +333,14 @@ class ViTLayer(nn.Module):
         norm_layer: Callable[..., nn.Module],
         norm_type: str,
         layer_scale: Optional[float],
-        act_layer: str
+        act_layer: str,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size: int = patch_size
         self.embed_dim: int = dim
         self.input_dims: List[int] = input_dims
+        self.use_gradient_checkpointing: bool = use_gradient_checkpointing
         self.blocks: nn.ModuleList = nn.ModuleList([
             ViTBlock(
                 embed_dim=dim,
@@ -359,6 +362,14 @@ class ViTLayer(nn.Module):
             for k in range(depth)
         ])
 
+    def _run_block(self, blk: nn.Module, x: Tensor, q_ms_patches: Optional[Tensor]) -> Tensor:
+        can_checkpoint = x.requires_grad or (q_ms_patches is not None and q_ms_patches.requires_grad)
+        if self.use_gradient_checkpointing and self.training and can_checkpoint:
+            if q_ms_patches is None:
+                return checkpoint(lambda x_: blk(x_, None), x, use_reentrant=False)
+            return checkpoint(lambda x_, q_: blk(x_, q_), x, q_ms_patches, use_reentrant=False)
+        return blk(x, q_ms_patches)
+
     def forward(self, inp: Tensor, q_ms: Optional[Tensor], CONCAT_ok: bool) -> Tensor:
         x: Tensor = inp.clone()
         x = rearrange(x, 'b c h w d -> b h w d c')
@@ -368,11 +379,11 @@ class ViTLayer(nn.Module):
 
         for blk in self.blocks:
             if q_ms is None:
-                x = blk(x, None)
+                x = self._run_block(blk, x, None)
             else:
                 q_ms_patches, _, _, _ = get_patches(q_ms, self.patch_size)
                 q_ms_patches = q_ms_patches.view(-1, self.patch_size ** ndims, x.size()[-1])
-                x = blk(x, q_ms_patches)
+                x = self._run_block(blk, x, q_ms_patches)
 
         x = rearrange(x, 'b h w d c -> b c h w d')
 
@@ -406,7 +417,8 @@ class ViT(nn.Module):
                  norm_layer=nn.LayerNorm,
                  layer_scale=None,
                  img_size=None,
-                 NUM_CROSS_ATT=-1):
+                 NUM_CROSS_ATT=-1,
+                 use_gradient_checkpointing: bool = False):
         super().__init__()
 
         # Determine the number of levels for processing
@@ -452,7 +464,8 @@ class ViT(nn.Module):
                 norm_layer=norm_layer,
                 layer_scale=layer_scale,
                 norm_type=norm_type,
-                act_layer=act_layer
+                act_layer=act_layer,
+                use_gradient_checkpointing=use_gradient_checkpointing,
             )
             self.levels.append(level)
 
@@ -639,7 +652,8 @@ class Decoder(nn.Module):
                         attn_drop_rate=config.get('attn_drop_rate', 0.),
                         norm_layer=nn.LayerNorm,
                         layer_scale=1e-5,
-                        img_size=img_size
+                        img_size=img_size,
+                        use_gradient_checkpointing=bool(config.get('use_gradient_checkpointing', False)),
                     )
                 )
         return out
@@ -699,6 +713,7 @@ class HierarchicalViT(nn.Module):
         emb_dim: int = config.get('start_channels', 32)
         data_size: Tuple[int, ...] = config.get('data_size', [160, 192, 224])
         self.out_fmaps: List[str] = config.get('out_fmaps', ['P4', 'P3', 'P2', 'P1'])
+        self.use_gradient_checkpointing: bool = bool(config.get('use_gradient_checkpointing', False))
 
         # Calculate number of stages
         num_stages: int = min(int(math.log2(min(data_size))) - 1,
@@ -749,7 +764,10 @@ class HierarchicalViT(nn.Module):
         down: Dict[str, Tensor] = {}
         if self.backbone in ['fpn', 'FPN']:
             for stage_id, module in enumerate(self._encoder):
-                x = module(x)
+                if self.use_gradient_checkpointing and self.training and x.requires_grad:
+                    x = checkpoint(module, x, use_reentrant=False)
+                else:
+                    x = module(x)
                 down[f'C{stage_id}'] = x
             up = self._decoder(down)
 
@@ -882,4 +900,3 @@ if __name__ == "__main__":
             print("[+] Maximum memory:\t{:.2f}GB: >>> \t{:.0f} feats".format(max_mem_mb, config['fpn_channels']) if max_mem_mb is not None else "")
             print("[+] Required Total memory:\t{:.2f}GB".format(torch.cuda.get_device_properties(0).total_memory/1024**3))
             print("[+] Trainable params:\t{:.5f} m".format(count_parameters(model)/1e6))
-

@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--data_source", choices=["auto", "real", "synthetic"], default="auto")
     parser.add_argument("--train_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
     parser.add_argument("--val_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
-    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs"], default="oasis_fs")
+    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs", "oasis_l2r"], default="auto")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=300)
@@ -178,6 +178,7 @@ def main():
             IterativeEvalCallback(
                 dataset=val_loader.dataset,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 every_n_epochs=args.iter_eval_every_n_epochs,
                 num_pairs=args.iter_eval_num_pairs,
                 batch_size=args.batch_size,

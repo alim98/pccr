@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import pickle
 import random
@@ -14,6 +15,8 @@ from torch.utils.data import Dataset
 
 
 def resize_volume(volume: torch.Tensor, spatial_size, mode: str) -> torch.Tensor:
+    if tuple(int(dim) for dim in volume.shape[1:]) == tuple(int(dim) for dim in spatial_size):
+        return volume
     volume = volume.unsqueeze(0)
     if mode == "nearest":
         resized = F.interpolate(volume.float(), size=spatial_size, mode=mode)
@@ -47,11 +50,17 @@ def load_volume(path: Path) -> np.ndarray:
 
 class OASIS_PklDataset(Dataset):
     def __init__(self, input_dim, data_path, num_steps=1000, is_pair: bool = False, ext="pkl"):
-        self.paths = glob.glob(os.path.join(data_path, f"*.{ext}"))
-        self.num_steps = num_steps
+        self.paths = sorted(glob.glob(os.path.join(data_path, f"*.{ext}")))
+        if not self.paths:
+            raise FileNotFoundError(f"No .{ext} files found under {data_path}")
         self.input_dim = input_dim
         self.is_pair = is_pair
+        self.num_steps = num_steps if num_steps and num_steps > 0 else len(self.paths)
+        self.native_shape = None
         self.num_labels = None
+        self.eval_label_ids: list[int] = []
+        self.sample_kind = "unknown"
+        self._infer_metadata()
 
     def _pkload(self, filename: str) -> tuple:
         try:
@@ -74,6 +83,31 @@ class OASIS_PklDataset(Dataset):
         tgt_lbl = resize_volume(tgt_lbl.float(), self.input_dim, mode="nearest").long()
         return src, tgt, src_lbl, tgt_lbl
 
+    def _infer_metadata(self) -> None:
+        sample = self._pkload(self.paths[0])
+        if not isinstance(sample, tuple):
+            raise TypeError(
+                f"Unsupported pickle payload type {type(sample).__name__} in {self.paths[0]}; expected tuple."
+            )
+
+        if len(sample) == 2:
+            image, label = sample
+            self.sample_kind = "subject"
+        elif len(sample) == 4:
+            image, _, label, _ = sample
+            self.sample_kind = "pair"
+        else:
+            raise ValueError(
+                f"Unsupported pickle payload length {len(sample)} in {self.paths[0]}; expected 2 or 4 entries."
+            )
+
+        image = np.asarray(image)
+        label = np.asarray(label)
+        self.native_shape = tuple(int(dim) for dim in image.shape)
+        max_label = int(label.max()) if label.size else 0
+        self.num_labels = max_label + 1
+        self.eval_label_ids = list(range(1, self.num_labels))
+
     def __getitem__(self, index):
         if self.is_pair:
             src, tgt, src_lbl, tgt_lbl = self._pkload(self.paths[index])
@@ -93,6 +127,17 @@ class OASISSubject:
     subject_id: str
     image_path: Path
     label_path: Path
+
+
+@dataclass(frozen=True)
+class OASISL2RMetadata:
+    train_subject_ids: list[str]
+    val_subject_ids: list[str]
+    test_subject_ids: list[str]
+    val_pairs: list[tuple[str, str]]
+    test_pairs: list[tuple[str, str]]
+    native_shape: tuple[int, int, int]
+    eval_label_ids: list[int]
 
 
 class OASISFolderDataset(Dataset):
@@ -172,6 +217,107 @@ class OASISFolderDataset(Dataset):
         return len(self.pairs) if self.is_pair else self.num_steps
 
 
+class OASISL2RDataset(Dataset):
+    def __init__(
+        self,
+        input_dim,
+        data_path,
+        split: str,
+        is_pair: bool,
+        val_fraction: float = 0.2,
+        split_seed: int = 42,
+        num_steps: int = 1000,
+        max_subjects: int = 0,
+        max_pairs: int = 0,
+    ):
+        self.input_dim = input_dim
+        self.is_pair = is_pair
+        self.num_steps = num_steps
+        self.split = split
+        self.metadata = load_oasis_l2r_metadata(Path(data_path))
+        self.native_shape = self.metadata.native_shape
+        self.eval_label_ids = list(self.metadata.eval_label_ids)
+        self.resampled = tuple(int(dim) for dim in input_dim) != tuple(self.native_shape)
+
+        train_subjects = discover_oasis_l2r_subjects(Path(data_path), subset="train")
+        try:
+            test_subjects = discover_oasis_l2r_subjects(Path(data_path), subset="test")
+        except FileNotFoundError:
+            test_subjects = {}
+
+        if split == "train":
+            split_ids = list(self.metadata.train_subject_ids)
+            if max_subjects > 0:
+                split_ids = split_ids[:max_subjects]
+            self.subjects = [train_subjects[subject_id] for subject_id in split_ids]
+            if len(self.subjects) < 2:
+                raise ValueError(f"Split '{split}' needs at least two subjects after filtering; got {len(self.subjects)}")
+            if self.is_pair:
+                self.pairs = list(combinations(self.subjects, 2))
+                if max_pairs > 0:
+                    self.pairs = self.pairs[:max_pairs]
+                if not self.pairs:
+                    raise ValueError(f"Split '{split}' did not produce any validation pairs.")
+            else:
+                self.pairs = None
+        elif split == "val":
+            self.subjects = [train_subjects[subject_id] for subject_id in self.metadata.val_subject_ids]
+            if self.is_pair:
+                self.pairs = [
+                    (train_subjects[fixed_id], train_subjects[moving_id])
+                    for fixed_id, moving_id in self.metadata.val_pairs
+                ]
+                if max_pairs > 0:
+                    self.pairs = self.pairs[:max_pairs]
+            else:
+                self.pairs = None
+            if len(self.subjects) < 2:
+                raise ValueError(f"Split '{split}' needs at least two subjects after filtering; got {len(self.subjects)}")
+        elif split == "test":
+            if not test_subjects:
+                raise FileNotFoundError(
+                    "Learn2Reg OASIS test labels are not available in this download; only train/val labeled splits can be loaded."
+                )
+            self.subjects = [test_subjects[subject_id] for subject_id in self.metadata.test_subject_ids]
+            if self.is_pair:
+                self.pairs = [
+                    (test_subjects[fixed_id], test_subjects[moving_id])
+                    for fixed_id, moving_id in self.metadata.test_pairs
+                ]
+                if max_pairs > 0:
+                    self.pairs = self.pairs[:max_pairs]
+            else:
+                self.pairs = None
+        else:
+            raise ValueError(f"Unsupported OASISL2R split: {split}")
+
+        self.max_label = int(max(load_volume(subject.label_path).max() for subject in self.subjects))
+        self.num_labels = self.max_label + 1
+
+    def _load_subject(self, subject: OASISSubject):
+        image = normalize_image(load_volume(subject.image_path))
+        label = load_volume(subject.label_path).astype(np.int64)
+        image_tensor = torch.from_numpy(image).unsqueeze(0)
+        label_tensor = torch.from_numpy(label).unsqueeze(0)
+        if self.resampled:
+            image_tensor = resize_volume(image_tensor, self.input_dim, mode="trilinear")
+            label_tensor = resize_volume(label_tensor.float(), self.input_dim, mode="nearest").long()
+        return image_tensor, label_tensor
+
+    def __getitem__(self, index):
+        if self.is_pair:
+            src_subject, tgt_subject = self.pairs[index]
+        else:
+            src_subject, tgt_subject = random.sample(self.subjects, 2)
+
+        src, src_lbl = self._load_subject(src_subject)
+        tgt, tgt_lbl = self._load_subject(tgt_subject)
+        return src, tgt, src_lbl, tgt_lbl
+
+    def __len__(self):
+        return len(self.pairs) if self.is_pair else self.num_steps
+
+
 def discover_oasis_subjects(data_path: Path) -> dict[str, OASISSubject]:
     seg_base = data_path / "seg" if (data_path / "seg").exists() else data_path
     raw_base = data_path / "raw" if (data_path / "raw").exists() else None
@@ -208,15 +354,97 @@ def discover_oasis_subjects(data_path: Path) -> dict[str, OASISSubject]:
     }
 
 
+def _parse_oasis_l2r_subject_id(relative_path: str | dict[str, str]) -> str:
+    if isinstance(relative_path, dict):
+        relative_path = relative_path.get("image", "")
+    return Path(relative_path).name.replace("_0000.nii.gz", "")
+
+
+def _parse_oasis_l2r_pair_list(entries: list[dict[str, str]]) -> list[tuple[str, str]]:
+    pairs = []
+    for item in entries:
+        pairs.append(
+            (
+                _parse_oasis_l2r_subject_id(item["fixed"]),
+                _parse_oasis_l2r_subject_id(item["moving"]),
+            )
+        )
+    return pairs
+
+
+def load_oasis_l2r_metadata(data_path: Path) -> OASISL2RMetadata:
+    metadata_path = data_path / "OASIS_dataset.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Learn2Reg OASIS metadata not found: {metadata_path}")
+
+    payload = json.loads(metadata_path.read_text())
+    native_shape = tuple(int(dim) for dim in payload["tensorImageShape"]["0"])
+    eval_label_ids = list(range(1, 36))
+
+    train_subject_ids = sorted(
+        _parse_oasis_l2r_subject_id(entry["image"])
+        for entry in payload.get("training", [])
+    )
+    val_pairs = _parse_oasis_l2r_pair_list(payload.get("registration_val", []))
+    val_subject_ids = sorted({subject_id for pair in val_pairs for subject_id in pair})
+    test_pairs = _parse_oasis_l2r_pair_list(payload.get("registration_test", []))
+    test_subject_ids = sorted(_parse_oasis_l2r_subject_id(path) for path in payload.get("test", []))
+
+    train_subject_ids = [subject_id for subject_id in train_subject_ids if subject_id not in set(val_subject_ids)]
+    return OASISL2RMetadata(
+        train_subject_ids=train_subject_ids,
+        val_subject_ids=val_subject_ids,
+        test_subject_ids=test_subject_ids,
+        val_pairs=val_pairs,
+        test_pairs=test_pairs,
+        native_shape=native_shape,
+        eval_label_ids=eval_label_ids,
+    )
+
+
+def discover_oasis_l2r_subjects(data_path: Path, subset: str = "train") -> dict[str, OASISSubject]:
+    if subset == "train":
+        image_dir = data_path / "imagesTr"
+        label_dir = data_path / "labelsTr"
+    elif subset == "test":
+        image_dir = data_path / "imagesTs"
+        label_dir = data_path / "labelsTs"
+    else:
+        raise ValueError(f"Unsupported Learn2Reg subset: {subset}")
+    if not image_dir.exists() or not label_dir.exists():
+        raise FileNotFoundError(
+            f"Learn2Reg OASIS layout requires {image_dir.name}/ and {label_dir.name}/ under {data_path}"
+        )
+
+    subjects: dict[str, OASISSubject] = {}
+    for image_path in sorted(image_dir.glob("*.nii.gz")):
+        stem = image_path.name
+        label_path = label_dir / stem
+        if not label_path.exists():
+            continue
+        subject_id = stem.replace("_0000.nii.gz", "")
+        subjects[subject_id] = OASISSubject(
+            subject_id=subject_id,
+            image_path=image_path,
+            label_path=label_path,
+        )
+
+    if not subjects:
+        raise FileNotFoundError(f"No Learn2Reg OASIS image/label pairs found under {data_path}")
+    return subjects
+
+
 def infer_dataset_format(data_path: str) -> str:
     path = Path(data_path)
     if list(path.glob("*.pkl")):
         return "pkl"
+    if (path / "imagesTr").exists() and (path / "labelsTr").exists():
+        return "oasis_l2r"
     if (path / "seg").exists() or (path / "mri" / "T1.mgz").exists():
         return "oasis_fs"
     raise ValueError(
         f"Could not infer dataset format for {data_path}. "
-        "Use a directory with .pkl files or an OASIS root/subject directory."
+        "Use a directory with .pkl files, a Learn2Reg OASIS layout, or an OASIS root/subject directory."
     )
 
 
@@ -246,6 +474,18 @@ def get_dataloader(
         )
     elif resolved_format == "oasis_fs":
         ds = OASISFolderDataset(
+            input_dim=input_dim,
+            data_path=data_path,
+            split=split,
+            is_pair=is_pair,
+            val_fraction=val_fraction,
+            split_seed=split_seed,
+            num_steps=num_steps,
+            max_subjects=max_subjects,
+            max_pairs=max_pairs,
+        )
+    elif resolved_format == "oasis_l2r":
+        ds = OASISL2RDataset(
             input_dim=input_dim,
             data_path=data_path,
             split=split,

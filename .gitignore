@@ -24,3 +24,10 @@ idea/
 # Generated evaluation artifacts
 *.csv
 *.png
+.claude/
+TransMorph_Transformer_for_Medical_Image_Registration
+archive/
+claude/
+jobs/
+results/
+third_party/

@@ -6,9 +6,44 @@ from typing import Any
 
 import yaml
 
+OASIS_L2R_NATIVE_SHAPE = [160, 224, 192]
+OASIS_L2R_EVAL_LABEL_IDS = list(range(1, 36))
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_yaml_with_base(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+
+    base_entry = payload.pop("base_config", None)
+    if base_entry is None:
+        return payload
+
+    base_paths = base_entry if isinstance(base_entry, list) else [base_entry]
+    merged: dict[str, Any] = {}
+    for base_item in base_paths:
+        base_path = Path(base_item)
+        if not base_path.is_absolute():
+            base_path = (path.parent / base_path).resolve()
+        merged = _deep_merge(merged, _load_yaml_with_base(base_path))
+    return _deep_merge(merged, payload)
+
 
 @dataclass
 class PCCRConfig:
+    dataset_variant: str = "default"
+    oasis_l2r_data_root: str = "~/data/oasis_l2r"
+    eval_label_ids: list[int] = field(default_factory=list)
+    align_data_size_to_native_shape: bool = True
     data_size: list[int] = field(default_factory=lambda: [40, 48, 56])
     in_channels: int = 1
     stage_channels: list[int] = field(default_factory=lambda: [32, 64, 128, 256])
@@ -24,6 +59,7 @@ class PCCRConfig:
     refined_matcher_offset_scale: float = 0.5
     refined_matcher_output_mode: str = "topm_reweighted"
     refined_matcher_topm: int = 2
+    global_match_voxel_limit: int = 50_000
     pointmap_stage_ids: list[int] = field(default_factory=lambda: [2, 3])
     decoder_stage_ids: list[int] = field(default_factory=lambda: [3, 2, 1, 0])
     svf_integration_steps: int = 7
@@ -44,6 +80,8 @@ class PCCRConfig:
     final_refinement_cost_volume_radius: int = 0
     final_refinement_cost_volume_proj_channels: int = 16
     final_refinement_cost_volume_feature_channels: int = 16
+    final_refinement_memory_efficient_cost_volume: bool = False
+    final_refinement_cost_volume_offset_chunk_size: int = 8
     final_refinement_use_local_residual_matcher: bool = False
     final_refinement_local_matcher_radius: int = 0
     final_refinement_local_matcher_proj_channels: int = 16
@@ -58,7 +96,17 @@ class PCCRConfig:
     stage1_local_refinement_proj_channels: int = 16
     stage1_local_refinement_feature_channels: int = 16
     stage1_local_refinement_temperature: float = 1.0
+    use_stage2_local_refinement: bool = False
+    stage2_local_refinement_radius: int = 0
+    stage2_local_refinement_proj_channels: int = 16
+    stage2_local_refinement_feature_channels: int = 16
+    stage2_local_refinement_temperature: float = 1.0
+    use_amp: bool = True
+    use_gradient_checkpointing: bool = False
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 1
     image_loss: str = "lncc"
+    lncc_window_size: int = 5
     multiscale_similarity_factors: list[int] = field(default_factory=lambda: [1])
     multiscale_similarity_weights: list[float] = field(default_factory=lambda: [1.0])
     image_loss_weight: float = 1.0
@@ -67,6 +115,7 @@ class PCCRConfig:
     jacobian_weight: float = 0.01
     inverse_consistency_weight: float = 0.1
     correspondence_weight: float = 0.2
+    synthetic_matchability_weight: float = 0.25
     residual_velocity_weight: float = 0.0
     decoder_fitting_weight: float = 0.0
     decoder_fitting_detach_target: bool = True
@@ -82,6 +131,9 @@ class PCCRConfig:
     canonical_head_lr_scale: float = 1.0
     coarse_decoder_lr_scale: float = 1.0
     residual_refinement_lr_scale: float = 1.0
+    lr_scheduler: str = "cosine"
+    lr_warmup_epochs: int = 0
+    lr_min_ratio: float = 0.0
     synthetic_warp_scale: float = 2.5
     synthetic_control_grid: list[int] = field(default_factory=lambda: [5, 6, 7])
     phase: str = "real"
@@ -89,8 +141,7 @@ class PCCRConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "PCCRConfig":
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = yaml.safe_load(handle) or {}
+        payload = _load_yaml_with_base(Path(path).resolve())
         return cls(**payload)
 
     def to_dict(self) -> dict[str, Any]:

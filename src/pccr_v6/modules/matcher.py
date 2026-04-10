@@ -65,8 +65,11 @@ class StructuredCandidateRefinedMatcher(CandidateRefinedMatcher):
         self,
         source: PointmapOutputs,
         target: PointmapOutputs,
-    ) -> StructuredMatchOutputs:
+        stage_id: int | None = None,
+    ) -> StructuredMatchOutputs | None:
         flattened = self._flatten_inputs(source, target)
+        if self._should_skip_global_matching(flattened, stage_id=stage_id):
+            return None
         canonical_distance = torch.cdist(flattened["src_canonical"], flattened["tgt_canonical"])
 
         num_voxels = canonical_distance.shape[-1]

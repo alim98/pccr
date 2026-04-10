@@ -31,12 +31,12 @@ def parse_args():
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--train_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
     parser.add_argument("--val_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
-    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs"], default="oasis_fs")
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs", "oasis_l2r"], default="auto")
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu"], default="auto")
     parser.add_argument("--num_gpus", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="bf16-mixed")
+    parser.add_argument("--precision", type=str, default=None)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--train_num_steps", type=int, default=200)
@@ -73,6 +73,14 @@ def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCC
     return config.apply_overrides(overrides)
 
 
+def resolve_precision(args, config: PCCRConfig, device: torch.device) -> str:
+    if device.type != "cuda":
+        return "32-true"
+    if args.precision is not None:
+        return args.precision
+    return "bf16-mixed" if config.use_amp else "32-true"
+
+
 def main():
     args = parse_args()
     torch.set_float32_matmul_precision("high")
@@ -83,6 +91,8 @@ def main():
 
     config = apply_config_overrides(PCCRConfig.from_yaml(args.config), args.config_override)
     config.phase = "real"
+    if args.batch_size is None:
+        args.batch_size = config.batch_size
 
     _, val_loader = create_real_pair_dataloaders(args, config)
     dataset_num_labels = getattr(val_loader.dataset, "num_labels", 0) or 0
@@ -112,11 +122,12 @@ def main():
     model.eval()
 
     device = resolve_device(args)
+    resolved_precision = resolve_precision(args, config, device)
     model = model.to(device)
     use_cuda = device.type == "cuda"
 
     records = []
-    autocast_enabled = use_cuda and args.precision.startswith("bf16")
+    autocast_enabled = use_cuda and resolved_precision.startswith("bf16")
     total_pairs = len(val_loader)
     print(
         f"Evaluating shard {args.shard_index + 1}/{args.num_shards}: "
@@ -130,6 +141,7 @@ def main():
                 source_label=source_label,
                 target_label=target_label,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 inference_seconds=0.0,
                 include_hd95=not args.skip_hd95,
             )
@@ -141,6 +153,7 @@ def main():
                 source_label=source_label,
                 target_label=target_label,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 transformer=model.model.decoder.final_transformer,
                 inference_seconds=elapsed,
                 include_hd95=not args.skip_hd95,

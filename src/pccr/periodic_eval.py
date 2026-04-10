@@ -76,6 +76,7 @@ class IterativeEvalCallback(Callback):
         self,
         dataset,
         num_labels: int,
+        label_ids: list[int] | None,
         every_n_epochs: int,
         num_pairs: int,
         batch_size: int,
@@ -91,6 +92,7 @@ class IterativeEvalCallback(Callback):
         self.every_n_epochs = every_n_epochs
         self.num_pairs = num_pairs
         self.num_labels = num_labels
+        self.label_ids = list(label_ids or [])
         self.precision = precision
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +140,7 @@ class IterativeEvalCallback(Callback):
                 source_label=source_label,
                 target_label=target_label,
                 num_labels=self.num_labels,
+                label_ids=self.label_ids,
                 transformer=pl_module.model.decoder.final_transformer,
                 inference_seconds=0.0,
                 include_hd95=self.include_hd95,
@@ -184,6 +187,7 @@ class IterativeEvalCallback(Callback):
                     source_label=source_label,
                     target_label=target_label,
                     num_labels=self.num_labels,
+                    label_ids=self.label_ids,
                     inference_seconds=0.0,
                     include_hd95=self.include_hd95,
                 )
@@ -194,6 +198,7 @@ class IterativeEvalCallback(Callback):
                     source_label=source_label,
                     target_label=target_label,
                     num_labels=self.num_labels,
+                    label_ids=self.label_ids,
                     transformer=pl_module.model.decoder.final_transformer,
                     inference_seconds=0.0,
                     include_hd95=self.include_hd95,

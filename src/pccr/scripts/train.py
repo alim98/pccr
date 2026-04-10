@@ -11,6 +11,7 @@ import yaml
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from src.pccr.config import PCCRConfig
 from src.pccr.data import (
@@ -45,12 +46,12 @@ def parse_args():
     parser.add_argument("--data_source", choices=["auto", "real", "synthetic"], default="auto")
     parser.add_argument("--train_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
     parser.add_argument("--val_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
-    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs"], default="oasis_fs")
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs", "oasis_l2r"], default="auto")
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--precision", type=str, default="bf16-mixed")
+    parser.add_argument("--precision", type=str, default=None)
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu"], default="auto")
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.2)
@@ -59,18 +60,25 @@ def parse_args():
     parser.add_argument("--max_train_subjects", type=int, default=0)
     parser.add_argument("--max_val_subjects", type=int, default=0)
     parser.add_argument("--max_val_pairs", type=int, default=0)
-    parser.add_argument("--logger_backend", choices=["aim", "csv", "none"], default="aim")
+    parser.add_argument("--logger_backend", choices=["aim", "csv", "tensorboard", "none"], default="aim")
     parser.add_argument("--aim_repo", type=str, default="/u/almik/others/hvit/aim")
     parser.add_argument("--experiment_name", type=str, default="pccr_oasis")
+    parser.add_argument("--ddp_find_unused_parameters", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--limit_train_batches", type=float, default=1.0)
     parser.add_argument("--limit_val_batches", type=float, default=1.0)
+    parser.add_argument("--check_val_every_n_epoch", type=int, default=1)
+    parser.add_argument("--checkpoint_every_n_epochs", type=int, default=1)
+    parser.add_argument("--checkpoint_every_n_train_steps", type=int, default=0)
+    parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--iter_eval_every_n_epochs", type=int, default=0)
     parser.add_argument("--iter_eval_num_pairs", type=int, default=100)
     parser.add_argument("--iter_eval_skip_hd95", action="store_true")
     parser.add_argument("--iter_viz_every_n_epochs", type=int, default=0)
     parser.add_argument("--iter_viz_pair_index", type=int, default=0)
+    parser.add_argument("--memory_probe_only", action="store_true")
+    parser.add_argument("--memory_warning_ratio", type=float, default=0.9)
     parser.add_argument("--overfit_num_pairs", type=int, default=0)
     parser.add_argument("--overfit_split", choices=["train", "val"], default="val")
     parser.add_argument(
@@ -94,6 +102,12 @@ def build_logger(args):
         return None
     if args.logger_backend == "csv":
         return CSVLogger(save_dir="logs", name=args.experiment_name)
+    if args.logger_backend == "tensorboard":
+        try:
+            return TensorBoardLogger(save_dir="logs", name=args.experiment_name)
+        except ModuleNotFoundError:
+            print("[pccr.train] TensorBoard is unavailable in this environment; falling back to CSV logging.")
+            return CSVLogger(save_dir="logs", name=args.experiment_name)
     AimLogger = load_aim_logger_class()
     return AimLogger(repo=args.aim_repo, experiment=args.experiment_name)
 
@@ -108,10 +122,98 @@ def resolve_devices(args):
     return "cpu", 1
 
 
-def resolve_strategy(accelerator: str, devices: int) -> str:
+def resolve_strategy(args, accelerator: str, devices: int) -> str:
     if accelerator == "gpu" and devices > 1:
-        return "ddp_find_unused_parameters_true"
+        find_unused = args.ddp_find_unused_parameters
+        if find_unused == "true" or (find_unused == "auto" and args.phase == "synthetic"):
+            return "ddp_find_unused_parameters_true"
+        return "ddp"
     return "auto"
+
+
+def resolve_precision(args, config: PCCRConfig, accelerator: str) -> str:
+    if accelerator != "gpu":
+        return "32-true"
+    if args.precision is not None:
+        return args.precision
+    return "bf16-mixed" if config.use_amp else "32-true"
+
+
+def resolve_autocast_dtype(precision: str) -> torch.dtype:
+    precision = precision.lower()
+    if precision.startswith("bf16"):
+        return torch.bfloat16
+    if precision.startswith("16"):
+        return torch.float16
+    return torch.float32
+
+
+def _move_batch_to_device(batch, device: torch.device):
+    return tuple(item.to(device) if torch.is_tensor(item) else item for item in batch)
+
+
+def run_memory_probe(
+    model: LiTPCCR,
+    train_loader,
+    precision: str,
+    warning_ratio: float,
+    device: torch.device,
+) -> None:
+    if device.type != "cuda":
+        print("[pccr.train] Memory probe skipped on non-CUDA device.")
+        return
+
+    model = model.to(device)
+    iterator = iter(train_loader)
+    try:
+        batch = next(iterator)
+    except StopIteration as exc:
+        raise RuntimeError("Training dataloader is empty; cannot run memory probe.") from exc
+
+    batch = _move_batch_to_device(batch, device)
+    dtype = resolve_autocast_dtype(precision)
+    autocast_enabled = dtype in {torch.bfloat16, torch.float16}
+    scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
+    optimizer = model.configure_optimizers()["optimizer"]
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    try:
+        try:
+            with torch.autocast(device_type="cuda", dtype=dtype, enabled=autocast_enabled):
+                _, losses, _, _ = model._compute_loss(batch)
+                loss = losses["avg_loss"]
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            torch.cuda.synchronize(device)
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                torch.cuda.empty_cache()
+                print("[pccr.train] Memory probe hit CUDA OOM.")
+            raise
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
+
+    peak_bytes = int(torch.cuda.max_memory_allocated(device))
+    total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+    utilization = peak_bytes / max(total_bytes, 1)
+    peak_gib = peak_bytes / float(1024 ** 3)
+    total_gib = total_bytes / float(1024 ** 3)
+    print(
+        f"[pccr.train] Memory probe peak allocation: {peak_gib:.2f} GiB / "
+        f"{total_gib:.2f} GiB ({utilization * 100.0:.1f}%)."
+    )
+    if utilization >= warning_ratio:
+        print(
+            "[pccr.train] WARNING: peak allocation exceeds "
+            f"{warning_ratio * 100.0:.0f}% of GPU memory. "
+            "Consider trying data_size=[80, 96, 112]."
+        )
 
 
 def apply_config_overrides(config: PCCRConfig, override_items: list[str]) -> PCCRConfig:
@@ -132,6 +234,8 @@ def main():
     torch.set_float32_matmul_precision("high")
     config = apply_config_overrides(PCCRConfig.from_yaml(args.config), args.config_override)
     config.phase = args.phase
+    if args.batch_size is None:
+        args.batch_size = config.batch_size
     if args.oracle_correspondence != "none":
         config.diagnostic_oracle_correspondence = True
     if args.oracle_handoff:
@@ -162,27 +266,64 @@ def main():
             config.num_labels = max(config.num_labels, dataset_num_labels)
 
     accelerator, devices = resolve_devices(args)
-    checkpoint_callback = ModelCheckpoint(
+    resolved_precision = resolve_precision(args, config, accelerator)
+    callbacks = []
+    periodic_checkpoint = ModelCheckpoint(
         dirpath=str(checkpoint_dir),
-        filename="epoch{epoch:03d}-val{val_avg_loss:.4f}" if val_loader is not None else "epoch{epoch:03d}",
+        filename="epoch{epoch:03d}",
         auto_insert_metric_name=False,
-        monitor="val_avg_loss" if val_loader is not None else None,
-        mode="min",
-        save_top_k=2 if val_loader is not None else -1,
+        monitor=None,
+        save_top_k=-1,
         save_last=True,
-        every_n_epochs=1,
+        every_n_epochs=max(int(args.checkpoint_every_n_epochs), 1),
     )
-    callbacks = [checkpoint_callback]
+    callbacks.append(periodic_checkpoint)
+    if int(args.checkpoint_every_n_train_steps) > 0:
+        step_checkpoint = ModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            filename="step{step:08d}",
+            auto_insert_metric_name=False,
+            monitor=None,
+            save_top_k=1,
+            save_last=True,
+            every_n_train_steps=int(args.checkpoint_every_n_train_steps),
+        )
+        callbacks.append(step_checkpoint)
+    if val_loader is not None and args.phase != "synthetic":
+        best_checkpoint = ModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            filename="best-dice-epoch{epoch:03d}-dice{val_dice:.4f}",
+            auto_insert_metric_name=False,
+            monitor="val_dice",
+            mode="max",
+            save_top_k=1,
+            save_last=False,
+            every_n_epochs=1,
+        )
+        callbacks.append(best_checkpoint)
+    elif val_loader is not None:
+        val_loss_checkpoint = ModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            filename="best-loss-epoch{epoch:03d}-val{val_avg_loss:.4f}",
+            auto_insert_metric_name=False,
+            monitor="val_avg_loss",
+            mode="min",
+            save_top_k=1,
+            save_last=False,
+            every_n_epochs=1,
+        )
+        callbacks.append(val_loss_checkpoint)
     if args.phase == "real" and args.iter_eval_every_n_epochs > 0:
         callbacks.append(
             IterativeEvalCallback(
                 dataset=val_loader.dataset,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 every_n_epochs=args.iter_eval_every_n_epochs,
                 num_pairs=args.iter_eval_num_pairs,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
-                precision=args.precision if accelerator == "gpu" else "32-true",
+                precision=resolved_precision,
                 output_dir=Path("logs") / "pccr" / args.experiment_name / "iter_eval",
                 include_hd95=not args.iter_eval_skip_hd95,
                 visualization_every_n_epochs=args.iter_viz_every_n_epochs,
@@ -198,18 +339,34 @@ def main():
         logger=experiment_logger,
         callbacks=callbacks,
         default_root_dir=str(Path("logs") / "pccr" / args.experiment_name),
-        precision=args.precision if accelerator == "gpu" else "32-true",
-        strategy=resolve_strategy(accelerator, devices),
+        precision=resolved_precision,
+        strategy=resolve_strategy(args, accelerator, devices),
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
+        accumulate_grad_batches=max(int(config.gradient_accumulation_steps), 1),
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
-        log_every_n_steps=1,
+        check_val_every_n_epoch=max(int(args.check_val_every_n_epoch), 1),
+        log_every_n_steps=max(int(args.log_every_n_steps), 1),
+        num_sanity_val_steps=0,
     )
 
     if args.mode == "train":
+        model = LiTPCCR(args=args, config=config, experiment_logger=experiment_logger)
+        probe_device = torch.device("cuda" if accelerator == "gpu" else "cpu")
+        if accelerator == "gpu" and devices == 1:
+            run_memory_probe(
+                model=model,
+                train_loader=train_loader,
+                precision=resolved_precision,
+                warning_ratio=args.memory_warning_ratio,
+                device=probe_device,
+            )
+        elif accelerator == "gpu" and devices > 1:
+            print("[pccr.train] Skipping memory probe for multi-GPU DDP run.")
+        if args.memory_probe_only:
+            return
         if args.resume_from_checkpoint:
-            model = LiTPCCR(args=args, config=config, experiment_logger=experiment_logger)
             trainer.fit(
                 model,
                 train_dataloaders=train_loader,

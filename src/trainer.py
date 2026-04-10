@@ -1,4 +1,6 @@
 import math
+import warnings
+from argparse import Namespace
 from contextlib import nullcontext
 
 import torch
@@ -40,6 +42,27 @@ class LiTHViT(LightningModule):
         self.dice_loss = DiceLoss(num_class=self.args.num_labels)
         self.experiment_logger = experiment_logger
         self.test_step_outputs = []
+
+    def _resolve_eval_label_ids(self):
+        label_ids = getattr(self.args, "eval_label_ids", None)
+        if not label_ids:
+            label_ids = self.config.get("eval_label_ids", [])
+        return [
+            int(label_id)
+            for label_id in label_ids
+            if 0 <= int(label_id) < self.args.num_labels
+        ]
+
+    def _mean_eval_score(self, score):
+        if not isinstance(score, torch.Tensor):
+            return torch.tensor(float(score), device=self.device)
+
+        label_ids = self._resolve_eval_label_ids()
+        if label_ids:
+            return score[:, label_ids].mean()
+        if score.shape[1] > 1:
+            return score[:, 1:].mean()
+        return score.mean()
 
     def _autocast_context(self):
         device_type = self.device.type if self.device is not None else "cpu"
@@ -127,6 +150,7 @@ class LiTHViT(LightningModule):
         with torch.no_grad():
             self.hvit.eval()
             _loss, _score = self._forward(batch, calc_score=True)
+        score_mean = self._mean_eval_score(_score)
     
         # Log each component of the validation loss
         for loss_name, loss_value in _loss.items():
@@ -134,16 +158,16 @@ class LiTHViT(LightningModule):
     
         # Log the mean validation score if available
         if _score is not None:
-            self.log("val_score", _score.mean(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log("val_score", score_mean, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
     
         # Log to the configured experiment tracker
         log_dict = {f"val_{k}": v.item() for k, v in _loss.items()}
         log_dict.update({
-            "val_score_mean": _score.mean().item() if _score is not None else None,
+            "val_score_mean": score_mean.item() if _score is not None else None,
         })
         self._log_metrics({k: v for k, v in log_dict.items() if v is not None}, step=self.global_step)
     
-        return {"val_loss": _loss["avg_loss"], "val_score": _score.mean().item()}
+        return {"val_loss": _loss["avg_loss"], "val_score": score_mean.item()}
 
     def on_validation_epoch_end(self):
         """
@@ -179,7 +203,7 @@ class LiTHViT(LightningModule):
             _, _score = self._forward(batch, calc_score=True)
     
         # Ensure _score is a tensor and take the mean
-        _score = _score.mean() if isinstance(_score, torch.Tensor) else torch.tensor(_score).mean()
+        _score = self._mean_eval_score(_score)
     
         self.test_step_outputs.append(_score)   
 
@@ -251,9 +275,17 @@ class LiTHViT(LightningModule):
         Returns:
             An instance of the model loaded from the checkpoint.
         """
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="You are using `torch.load` with `weights_only=False`",
+                category=FutureWarning,
+            )
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         args = args or checkpoint.get('hyper_parameters', {}).get('args')
+        if isinstance(args, dict):
+            args = Namespace(**args)
         config = checkpoint.get('hyper_parameters', {}).get('config')
         
         save_every = getattr(args, "save_model_every_n_epochs", 10) if args is not None else 10
@@ -275,6 +307,7 @@ class LiTHViT(LightningModule):
             checkpoint: The checkpoint dictionary to be saved.
         """
         checkpoint['hyper_parameters'] = {
+            'args': vars(self.args) if hasattr(self.args, "__dict__") else self.args,
             'config': self.config,
             'lr': self.lr,
             'best_val_loss': self.best_val_loss,

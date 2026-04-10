@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--train_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
     parser.add_argument("--val_data_path", type=str, default="/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis")
-    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs"], default="oasis_fs")
+    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs", "oasis_l2r"], default="auto")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu"], default="auto")
@@ -152,6 +152,7 @@ def main():
                 source_label=source_label,
                 target_label=target_label,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 inference_seconds=0.0,
                 include_hd95=not args.skip_hd95,
             )
@@ -163,6 +164,7 @@ def main():
                 source_label=source_label,
                 target_label=target_label,
                 num_labels=config.num_labels,
+                label_ids=config.eval_label_ids,
                 transformer=model.model.decoder.final_transformer,
                 inference_seconds=elapsed,
                 include_hd95=not args.skip_hd95,

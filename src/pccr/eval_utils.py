@@ -16,6 +16,33 @@ from src.model.transformation import SpatialTransformer
 from src.utils import get_one_hot
 
 
+def resolve_eval_label_ids(num_labels: int, label_ids: list[int] | None = None) -> list[int]:
+    if label_ids:
+        return [label_id for label_id in label_ids if 0 <= int(label_id) < num_labels]
+    return list(range(1, num_labels))
+
+
+def dice_score_array(
+    warped_onehot: torch.Tensor,
+    target_label: torch.Tensor,
+    num_labels: int,
+) -> np.ndarray:
+    return DiceScore(warped_onehot, target_label.long(), num_labels).detach().cpu().numpy()
+
+
+def per_label_dice_statistics(
+    warped_onehot: torch.Tensor,
+    target_label: torch.Tensor,
+    num_labels: int,
+    label_ids: list[int] | None = None,
+) -> dict[int, float]:
+    scores = dice_score_array(warped_onehot, target_label, num_labels)
+    return {
+        int(label_id): float(scores[:, int(label_id)].mean())
+        for label_id in resolve_eval_label_ids(num_labels, label_ids)
+    }
+
+
 def warp_segmentation(
     label: torch.Tensor,
     displacement: torch.Tensor,
@@ -40,9 +67,11 @@ def dice_statistics(
     warped_onehot: torch.Tensor,
     target_label: torch.Tensor,
     num_labels: int,
+    label_ids: list[int] | None = None,
 ) -> dict[str, float]:
-    scores = DiceScore(warped_onehot, target_label.long(), num_labels).detach().cpu().numpy()
-    foreground = scores[:, 1:] if scores.shape[1] > 1 else scores
+    scores = dice_score_array(warped_onehot, target_label, num_labels)
+    selected_label_ids = resolve_eval_label_ids(num_labels, label_ids)
+    foreground = scores[:, selected_label_ids] if selected_label_ids else (scores[:, 1:] if scores.shape[1] > 1 else scores)
     return {
         "dice_mean_all": float(scores.mean()),
         "dice_mean_fg": float(foreground.mean()) if foreground.size else float(scores.mean()),
@@ -53,9 +82,10 @@ def label_dice_statistics(
     predicted_label: torch.Tensor,
     target_label: torch.Tensor,
     num_labels: int,
+    label_ids: list[int] | None = None,
 ) -> dict[str, float]:
     predicted_onehot = get_one_hot(predicted_label.long(), num_labels).float()
-    return dice_statistics(predicted_onehot, target_label, num_labels)
+    return dice_statistics(predicted_onehot, target_label, num_labels, label_ids=label_ids)
 
 
 def _surface_distances(mask_a: np.ndarray, mask_b: np.ndarray) -> np.ndarray:
@@ -80,12 +110,13 @@ def hd95_statistics(
     predicted_label: torch.Tensor,
     target_label: torch.Tensor,
     num_labels: int,
+    label_ids: list[int] | None = None,
 ) -> dict[str, float]:
     pred = predicted_label.squeeze(0).squeeze(0).detach().cpu().numpy()
     target = target_label.squeeze(0).squeeze(0).detach().cpu().numpy()
 
     hd95_values = []
-    for label_id in range(1, num_labels):
+    for label_id in resolve_eval_label_ids(num_labels, label_ids):
         distances = _surface_distances(pred == label_id, target == label_id)
         if distances.size > 0:
             hd95_values.append(float(np.percentile(distances, 95)))
@@ -139,13 +170,14 @@ def identity_metrics(
     source_label: torch.Tensor,
     target_label: torch.Tensor,
     num_labels: int,
+    label_ids: list[int] | None = None,
     inference_seconds: float = 0.0,
     include_hd95: bool = True,
 ) -> dict[str, float]:
     metrics = {}
-    metrics.update(label_dice_statistics(source_label, target_label, num_labels))
+    metrics.update(label_dice_statistics(source_label, target_label, num_labels, label_ids=label_ids))
     if include_hd95:
-        metrics.update(hd95_statistics(source_label, target_label, num_labels))
+        metrics.update(hd95_statistics(source_label, target_label, num_labels, label_ids=label_ids))
     else:
         metrics.update({"hd95_mean_fg": math.nan, "hd95_median_fg": math.nan})
     metrics.update(
@@ -180,14 +212,15 @@ def pair_metrics(
     transformer: SpatialTransformer,
     inference_seconds: float,
     include_hd95: bool = True,
+    label_ids: list[int] | None = None,
 ) -> dict[str, float]:
     displacement = outputs["phi_s2t"]
     warped_onehot, warped_label = warp_segmentation(source_label, displacement, num_labels, transformer)
 
     metrics = {}
-    metrics.update(dice_statistics(warped_onehot, target_label, num_labels))
+    metrics.update(dice_statistics(warped_onehot, target_label, num_labels, label_ids=label_ids))
     if include_hd95:
-        metrics.update(hd95_statistics(warped_label, target_label, num_labels))
+        metrics.update(hd95_statistics(warped_label, target_label, num_labels, label_ids=label_ids))
     else:
         metrics.update({"hd95_mean_fg": math.nan, "hd95_median_fg": math.nan})
     metrics.update(jacobian_statistics(displacement))

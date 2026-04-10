@@ -18,6 +18,7 @@ class PCCRV6Model(PCCRModel):
             matchability_score_mode=config.matchability_score_mode,
             matchability_score_power=config.matchability_score_power,
             confidence_mode=config.matcher_confidence_mode,
+            global_match_voxel_limit=config.global_match_voxel_limit,
         )
         if config.matcher_type == "candidate_structured":
             self.matcher = StructuredCandidateRefinedMatcher(

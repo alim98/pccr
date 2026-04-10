@@ -43,6 +43,7 @@ class PCCRModel(nn.Module):
             in_channels=config.in_channels,
             stage_channels=config.stage_channels,
             kernel_size=config.kernel_size,
+            use_gradient_checkpointing=config.use_gradient_checkpointing,
         )
         self.pointmap_head = PairConditionedPointmapHead(
             stage_channels=config.stage_channels,
@@ -58,6 +59,7 @@ class PCCRModel(nn.Module):
             matchability_score_mode=config.matchability_score_mode,
             matchability_score_power=config.matchability_score_power,
             confidence_mode=config.matcher_confidence_mode,
+            global_match_voxel_limit=config.global_match_voxel_limit,
         )
         if config.matcher_type == "candidate_refined":
             self.matcher = CandidateRefinedMatcher(
@@ -91,6 +93,8 @@ class PCCRModel(nn.Module):
             final_refinement_cost_volume_radius=config.final_refinement_cost_volume_radius,
             final_refinement_cost_volume_proj_channels=config.final_refinement_cost_volume_proj_channels,
             final_refinement_cost_volume_feature_channels=config.final_refinement_cost_volume_feature_channels,
+            final_refinement_memory_efficient_cost_volume=config.final_refinement_memory_efficient_cost_volume,
+            final_refinement_cost_volume_offset_chunk_size=config.final_refinement_cost_volume_offset_chunk_size,
             final_refinement_use_local_residual_matcher=config.final_refinement_use_local_residual_matcher,
             final_refinement_local_matcher_radius=config.final_refinement_local_matcher_radius,
             final_refinement_local_matcher_proj_channels=config.final_refinement_local_matcher_proj_channels,
@@ -101,6 +105,12 @@ class PCCRModel(nn.Module):
             stage1_local_refinement_proj_channels=config.stage1_local_refinement_proj_channels,
             stage1_local_refinement_feature_channels=config.stage1_local_refinement_feature_channels,
             stage1_local_refinement_temperature=config.stage1_local_refinement_temperature,
+            use_stage2_local_refinement=config.use_stage2_local_refinement,
+            stage2_local_refinement_radius=config.stage2_local_refinement_radius,
+            stage2_local_refinement_proj_channels=config.stage2_local_refinement_proj_channels,
+            stage2_local_refinement_feature_channels=config.stage2_local_refinement_feature_channels,
+            stage2_local_refinement_temperature=config.stage2_local_refinement_temperature,
+            use_gradient_checkpointing=config.use_gradient_checkpointing,
             diagnostic_residual_only=config.diagnostic_residual_only,
         )
 
@@ -181,10 +191,15 @@ class PCCRModel(nn.Module):
             )
         else:
             source_pointmaps, target_pointmaps = self.pointmap_head(source_features, target_features)
-            match_outputs = {
-                stage_id: self.matcher(source_pointmaps[stage_id], target_pointmaps[stage_id])
-                for stage_id in source_pointmaps
-            }
+            match_outputs = {}
+            for stage_id in source_pointmaps:
+                stage_match = self.matcher(
+                    source_pointmaps[stage_id],
+                    target_pointmaps[stage_id],
+                    stage_id=stage_id,
+                )
+                if stage_match is not None:
+                    match_outputs[stage_id] = stage_match
         decoder_outputs = self.decoder(
             source_image=source,
             target_image=target,

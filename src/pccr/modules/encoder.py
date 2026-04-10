@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from src.model.hvit_light import EncoderCnnBlock
 
@@ -14,8 +15,10 @@ class SharedPyramidEncoder(nn.Module):
         in_channels: int,
         stage_channels: list[int],
         kernel_size: int = 3,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         blocks = []
         current_in = in_channels
         for stage_id, channels in enumerate(stage_channels):
@@ -35,7 +38,10 @@ class SharedPyramidEncoder(nn.Module):
         outputs: dict[int, torch.Tensor] = {}
         features = image
         for stage_id, block in enumerate(self.blocks):
-            features = block(features)
+            if self.use_gradient_checkpointing and self.training and torch.is_grad_enabled():
+                features = checkpoint(block, features, use_reentrant=False)
+            else:
+                features = block(features)
             outputs[stage_id] = features
         return outputs
 

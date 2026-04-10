@@ -16,7 +16,7 @@ torch.set_float32_matmul_precision('medium')
 from src import logger
 from src.trainer import LiTHViT
 from src.utils import read_yaml_file
-from src.data.datasets import get_dataloader
+from src.data.datasets import get_dataloader, infer_dataset_format, load_oasis_l2r_metadata
 
 
 LIGHTNING_PRECISION_MAP = {
@@ -25,30 +25,35 @@ LIGHTNING_PRECISION_MAP = {
     "fp32": "32-true",
 }
 
+DEFAULT_TRAIN_DATA_PATH = "/dss/dssmcmlfs01/pr62la/pr62la-dss-0002/Mori/DATA/OASIS/OASIS_L2R_2021_task03/train"
+DEFAULT_VAL_DATA_PATH = "/dss/dssmcmlfs01/pr62la/pr62la-dss-0002/Mori/DATA/OASIS/OASIS_L2R_2021_task03/test"
+DEFAULT_TEST_DATA_PATH = "/home/mori/HViT/OASIS_small/test"
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run training or inference")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to the YAML config")
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use. Use '-1' for all available GPUs.")
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu"], default="auto", help="Execution accelerator")
     parser.add_argument("--experiment_name", type=str, default="OASIS", help="Experiment name")
     parser.add_argument("--mode", choices=["train", "inference"], default="train", help="Mode to run: train or inference")
-    parser.add_argument("--train_data_path", type=str, default="/dss/dssmcmlfs01/pr62la/pr62la-dss-0002/Mori/DATA/OASIS/OASIS_L2R_2021_task03/train", help="Path to the train set")
-    parser.add_argument("--val_data_path", type=str, default="/dss/dssmcmlfs01/pr62la/pr62la-dss-0002/Mori/DATA/OASIS/OASIS_L2R_2021_task03/test", help="Path to the validation set")
-    parser.add_argument("--test_data_path", type=str, default="/home/mori/HViT/OASIS_small/test", help="Path to the test set")
+    parser.add_argument("--train_data_path", type=str, default=None, help="Path to the train set")
+    parser.add_argument("--val_data_path", type=str, default=None, help="Path to the validation set")
+    parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test set")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to the model/checkpoint_path to load")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to the best model")
     parser.add_argument("--mse_weights",type=float, default=1, help="MSE Loss weights")
     parser.add_argument("--dice_weights", type=float, default=1, help="Dice Loss weights")
     parser.add_argument("--grad_weights", type=float, default=0.02, help="Grad Loss weights")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size")
     parser.add_argument("--tgt2src_reg", type=lambda x: str(x).lower() in {"1", "true", "yes", "y"}, default=True, help="target to source registration during training")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers")
-    parser.add_argument("--max_epochs", type=int, default=1000, help="Maximum number of epochs")
-    parser.add_argument("--num_labels", type=int, default=36, help="Number of labels")
-    parser.add_argument("--precision", type=str, default='bf16', help="Precision")
-    parser.add_argument("--hvit_light", type=lambda x: str(x).lower() in {"1", "true", "yes", "y"}, default=True, help="Use HViT-Light")
-    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs"], default="auto", help="Dataset layout")
+    parser.add_argument("--max_epochs", type=int, default=None, help="Maximum number of epochs")
+    parser.add_argument("--num_labels", type=int, default=None, help="Number of labels")
+    parser.add_argument("--precision", type=str, default=None, help="Precision")
+    parser.add_argument("--hvit_light", type=lambda x: str(x).lower() in {"1", "true", "yes", "y"}, default=None, help="Use HViT-Light")
+    parser.add_argument("--dataset_format", choices=["auto", "pkl", "oasis_fs", "oasis_l2r"], default="auto", help="Dataset layout")
     parser.add_argument("--val_fraction", type=float, default=0.2, help="Validation fraction when using a shared OASIS root")
     parser.add_argument("--split_seed", type=int, default=42, help="Seed used for train/val split")
     parser.add_argument("--train_num_steps", type=int, default=1000, help="Training samples per epoch for random-pair datasets")
@@ -58,7 +63,7 @@ def parse_arguments():
     parser.add_argument("--limit_train_batches", type=float, default=1.0, help="Lightning limit for train batches")
     parser.add_argument("--limit_val_batches", type=float, default=1.0, help="Lightning limit for validation batches")
     parser.add_argument("--limit_test_batches", type=float, default=1.0, help="Lightning limit for test batches")
-    parser.add_argument("--save_model_every_n_epochs", type=int, default=1, help="Checkpoint save frequency in epochs")
+    parser.add_argument("--save_model_every_n_epochs", type=int, default=None, help="Checkpoint save frequency in epochs")
     parser.add_argument("--logger_backend", choices=["aim", "csv", "none"], default="aim", help="Experiment logger backend")
     parser.add_argument("--aim_repo", type=str, default="/u/almik/others/hvit/aim", help="Path to the Aim repo")
     parser.add_argument("--aim_experiment", type=str, default=None, help="Aim experiment name")
@@ -124,18 +129,91 @@ def resolve_trainer_precision(args, accelerator):
         return LIGHTNING_PRECISION_MAP["fp32"]
     return LIGHTNING_PRECISION_MAP.get(args.precision, LIGHTNING_PRECISION_MAP["fp32"])
 
+
+def resolve_data_path(args, config, split: str) -> str:
+    cli_value = getattr(args, f"{split}_data_path")
+    if cli_value:
+        return cli_value
+    if config.get("dataset_format") == "oasis_l2r" and config.get("oasis_l2r_data_root"):
+        return str(Path(config["oasis_l2r_data_root"]).expanduser())
+    fallback = {
+        "train": DEFAULT_TRAIN_DATA_PATH,
+        "val": DEFAULT_VAL_DATA_PATH,
+        "test": DEFAULT_TEST_DATA_PATH,
+    }
+    return fallback[split]
+
+
+def resolve_dataset_format(args, config, data_path: str) -> str:
+    if args.dataset_format != "auto":
+        return args.dataset_format
+    configured = config.get("dataset_format", "auto")
+    if configured != "auto":
+        return configured
+    return infer_dataset_format(data_path)
+
+
+def sync_config_with_dataset(config: dict, data_path: str, dataset_format: str) -> None:
+    if dataset_format != "oasis_l2r":
+        if "eval_label_ids" not in config:
+            config["eval_label_ids"] = []
+        return
+
+    metadata = load_oasis_l2r_metadata(Path(data_path))
+    native_shape = list(metadata.native_shape)
+    if list(config.get("data_size", [])) != native_shape:
+        print(
+            "[hvit.main] Aligning config.data_size "
+            f"from {config.get('data_size')} to dataset native shape {native_shape}."
+        )
+        config["data_size"] = native_shape
+
+    if not config.get("eval_label_ids"):
+        config["eval_label_ids"] = list(metadata.eval_label_ids)
+    config["num_labels"] = max(int(config.get("num_labels", 0) or 0), max(metadata.eval_label_ids) + 1)
+
+
+def apply_runtime_defaults(args, config: dict) -> None:
+    if args.batch_size is None:
+        args.batch_size = int(config.get("batch_size", 2))
+    if args.max_epochs is None:
+        args.max_epochs = int(config.get("max_epochs", 1000))
+    if args.num_labels is None:
+        args.num_labels = int(config.get("num_labels", 36))
+    if args.precision is None:
+        if "precision" in config:
+            args.precision = str(config["precision"])
+        elif config.get("use_amp", False):
+            args.precision = "bf16"
+        else:
+            args.precision = "fp32"
+    if args.hvit_light is None:
+        args.hvit_light = bool(config.get("hvit_light", True))
+    if args.save_model_every_n_epochs is None:
+        args.save_model_every_n_epochs = int(config.get("save_model_every_n_epochs", 1))
+    args.eval_label_ids = [int(label_id) for label_id in config.get("eval_label_ids", [])]
+
 def main():
     args = parse_arguments()
-    config = read_yaml_file("./config/config.yaml")
+    config = read_yaml_file(args.config)
+    if config is None:
+        raise ValueError(f"Failed to read config file: {args.config}")
+
+    train_data_path = resolve_data_path(args, config, "train")
+    val_data_path = resolve_data_path(args, config, "val")
+    test_data_path = resolve_data_path(args, config, "test")
+    resolved_dataset_format = resolve_dataset_format(args, config, train_data_path)
+    sync_config_with_dataset(config, train_data_path, resolved_dataset_format)
+    apply_runtime_defaults(args, config)
 
     experiment_logger = build_logger(args)
     if experiment_logger is not None and hasattr(experiment_logger, "log_hyperparams"):
         experiment_logger.log_hyperparams(
             {
                 "experiment_name": args.experiment_name,
-                "dataset_format": args.dataset_format,
-                "train_data_path": args.train_data_path,
-                "val_data_path": args.val_data_path,
+                "dataset_format": resolved_dataset_format,
+                "train_data_path": train_data_path,
+                "val_data_path": val_data_path,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "precision": args.precision,
@@ -147,11 +225,11 @@ def main():
 
     # get dataloaders
     train_dataloader = get_dataloader(
-        data_path=args.train_data_path,
+        data_path=train_data_path,
         input_dim=config["data_size"],
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        dataset_format=args.dataset_format,
+        dataset_format=resolved_dataset_format,
         split="train",
         is_pair=False,
         val_fraction=args.val_fraction,
@@ -161,11 +239,11 @@ def main():
     )
 
     val_dataloader = get_dataloader(
-        data_path=args.val_data_path,
+        data_path=val_data_path,
         input_dim=config["data_size"],
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        dataset_format=args.dataset_format,
+        dataset_format=resolved_dataset_format,
         split="val",
         is_pair=True,
         shuffle=False,
@@ -182,6 +260,10 @@ def main():
     if dataset_num_labels:
         args.num_labels = max(args.num_labels, dataset_num_labels)
         logger.info(f"Using num_labels={args.num_labels}")
+    for dataset in (getattr(train_dataloader, "dataset", None), getattr(val_dataloader, "dataset", None)):
+        if dataset is not None and getattr(dataset, "eval_label_ids", None) and not args.eval_label_ids:
+            args.eval_label_ids = [int(label_id) for label_id in dataset.eval_label_ids]
+            break
 
     accelerator, devices = resolve_trainer_device(args)
     if accelerator == "cpu":
@@ -233,11 +315,11 @@ def main():
         logger.info("Starting inference")
 
         test_dataloader = get_dataloader(
-            data_path=args.test_data_path,
+            data_path=test_data_path,
             input_dim=config["data_size"],
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            dataset_format=args.dataset_format,
+            dataset_format=resolved_dataset_format,
             split="val",
             is_pair=True,
             shuffle=False,

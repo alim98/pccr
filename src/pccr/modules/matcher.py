@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import torch
 import torch.nn as nn
@@ -8,6 +9,8 @@ import torch.nn.functional as F
 
 from src.pccr.modules.pointmap import PointmapOutputs
 from src.pccr.utils import flatten_spatial, softmax_entropy, voxel_grid
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +99,7 @@ class _BaseCorrelationMatcher(nn.Module):
         matchability_score_mode: str = "legacy",
         matchability_score_power: float = 0.5,
         confidence_mode: str = "max_prob",
+        global_match_voxel_limit: int = 50_000,
     ) -> None:
         super().__init__()
         self.temperature = temperature
@@ -104,6 +108,8 @@ class _BaseCorrelationMatcher(nn.Module):
         self.matchability_score_mode = matchability_score_mode
         self.matchability_score_power = matchability_score_power
         self.confidence_mode = confidence_mode
+        self.global_match_voxel_limit = global_match_voxel_limit
+        self._warned_skip_keys: set[str] = set()
 
     def _flatten_inputs(
         self,
@@ -202,6 +208,32 @@ class _BaseCorrelationMatcher(nn.Module):
             source_positions=source_positions,
         )
 
+    def _should_skip_global_matching(
+        self,
+        flattened: dict[str, torch.Tensor],
+        stage_id: int | None = None,
+    ) -> bool:
+        if self.global_match_voxel_limit <= 0:
+            return False
+        num_source = flattened["src_canonical"].shape[1]
+        num_target = flattened["tgt_canonical"].shape[1]
+        num_voxels = max(num_source, num_target)
+        if num_voxels <= self.global_match_voxel_limit:
+            return False
+
+        stage_label = f"stage {stage_id}" if stage_id is not None else f"shape {flattened['spatial_shape']}"
+        warning_key = f"{stage_label}:{flattened['spatial_shape']}"
+        if warning_key not in self._warned_skip_keys:
+            LOGGER.warning(
+                "Skipping global canonical matching for %s because it has %d voxels, above limit %d. "
+                "Decoder should fall back to local correlation refinement.",
+                stage_label,
+                num_voxels,
+                self.global_match_voxel_limit,
+            )
+            self._warned_skip_keys.add(warning_key)
+        return True
+
 
 class CanonicalCorrelationMatcher(_BaseCorrelationMatcher):
     """Dense matcher guided by canonical coordinates and descriptor affinity."""
@@ -210,8 +242,11 @@ class CanonicalCorrelationMatcher(_BaseCorrelationMatcher):
         self,
         source: PointmapOutputs,
         target: PointmapOutputs,
-    ) -> MatchOutputs:
+        stage_id: int | None = None,
+    ) -> MatchOutputs | None:
         flattened = self._flatten_inputs(source, target)
+        if self._should_skip_global_matching(flattened, stage_id=stage_id):
+            return None
         canonical_distance = torch.cdist(flattened["src_canonical"], flattened["tgt_canonical"])
         descriptor_similarity = torch.einsum(
             "bid,bjd->bij",
@@ -275,8 +310,11 @@ class CandidateRefinedMatcher(_BaseCorrelationMatcher):
         self,
         source: PointmapOutputs,
         target: PointmapOutputs,
-    ) -> MatchOutputs:
+        stage_id: int | None = None,
+    ) -> MatchOutputs | None:
         flattened = self._flatten_inputs(source, target)
+        if self._should_skip_global_matching(flattened, stage_id=stage_id):
+            return None
         canonical_distance = torch.cdist(flattened["src_canonical"], flattened["tgt_canonical"])
 
         num_voxels = canonical_distance.shape[-1]

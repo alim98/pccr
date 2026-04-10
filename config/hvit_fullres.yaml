@@ -1,0 +1,78 @@
+model_type: HViT
+backbone_net: fpn
+fpn_channels: 128
+start_channels: 32
+out_fmaps:
+  - P4
+  - P3
+  - P2
+  - P1
+scale_level_df: P1
+upsample_df: true
+upsample_scale_factor: 2
+patch_size: 2
+in_channels: 1
+data_size:
+  - 160
+  - 192
+  - 224
+bias: true
+norm_type: instance
+cuda: 0
+kernel_size: 3
+depths: 1
+mlp_ratio: 2
+num_heads: 32
+drop_path_rate: 0.0
+qkv_bias: true
+drop_rate: 0.0
+attn_drop_rate: 0.0
+use_seg_loss: false
+use_seg_proxy_loss: false
+num_organs: -1
+dataset_format: oasis_l2r
+oasis_l2r_data_root: /nexus/posix0/MBR-neuralsystems/alim/regdata/oasis_l2r
+eval_label_ids:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
+  - 24
+  - 25
+  - 26
+  - 27
+  - 28
+  - 29
+  - 30
+  - 31
+  - 32
+  - 33
+  - 34
+  - 35
+num_labels: 36
+batch_size: 1
+use_amp: true
+precision: bf16
+use_gradient_checkpointing: true
+hvit_light: true
+max_epochs: 300
+save_model_every_n_epochs: 1
