@@ -1,0 +1,12 @@
+base_config: ./pairwise_oasis_transmorph_pkl_full_final.yaml
+
+# Primary fix: 4x stronger direct dice signal.
+# In full_final the seg loss was 25x weaker than image loss (0.05 vs 1.25),
+# contributing almost no gradient toward the evaluation metric.
+# At 0.20 the ratio is 6:1 — still image-loss-dominant but meaningfully coupled to dice.
+segmentation_supervision_weight: 0.20
+
+# Stabilize SDlogJ. In the full_final run SDlogJ trended 0.59→0.67 over 17 epochs
+# because smoothness_weight was halved to 0.01. Restoring 0.015 keeps the
+# diffeomorphic constraint active without competing strongly with the other terms.
+smoothness_weight: 0.015

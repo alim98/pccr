@@ -30,6 +30,71 @@ class LNCCLoss(nn.Module):
         return torch.nan_to_num(1.0 - lncc.mean(), nan=1.0, posinf=1.0, neginf=1.0)
 
 
+class MultiWindowLNCCLoss(nn.Module):
+    """Average LNCC across several window sizes.
+
+    Smaller windows respond to fine structures (e.g. hippocampus, amygdala);
+    larger windows stabilise the cortical sheet. Drop-in replacement for
+    LNCCLoss when ``windows`` has a single entry.
+    """
+
+    def __init__(self, windows: list[int]) -> None:
+        super().__init__()
+        if not windows:
+            raise ValueError("MultiWindowLNCCLoss requires at least one window size.")
+        self.losses = nn.ModuleList([LNCCLoss(window_size=int(w)) for w in windows])
+
+    def forward(self, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        per_window = [loss(source, target) for loss in self.losses]
+        return torch.stack(per_window).mean()
+
+
+class HyperelasticRegularizer(nn.Module):
+    """Penalise volume distortion of the displacement field symmetrically.
+
+    Loss = mean( (det(J) - 1)^p + (1/det(J) - 1)^p ).
+
+    Unlike NegativeJacobianLoss which only penalises folding (det <= 0),
+    this penalises both compression (det << 1) and expansion (det >> 1)
+    symmetrically, allowing large but volume-preserving deformations and
+    keeping SDlogJ small without sacrificing dice.
+    """
+
+    def __init__(self, power: float = 2.0, det_clamp: float = 0.05) -> None:
+        super().__init__()
+        self.power = float(power)
+        self.det_clamp = float(det_clamp)
+
+    def forward(self, displacement: torch.Tensor) -> torch.Tensor:
+        dx = displacement[:, :, 1:, :-1, :-1] - displacement[:, :, :-1, :-1, :-1]
+        dy = displacement[:, :, :-1, 1:, :-1] - displacement[:, :, :-1, :-1, :-1]
+        dz = displacement[:, :, :-1, :-1, 1:] - displacement[:, :, :-1, :-1, :-1]
+
+        jac = torch.zeros(
+            displacement.shape[0],
+            3,
+            3,
+            *dx.shape[2:],
+            device=displacement.device,
+            dtype=displacement.dtype,
+        )
+        jac[:, 0, 0] = 1 + dx[:, 0]
+        jac[:, 0, 1] = dy[:, 0]
+        jac[:, 0, 2] = dz[:, 0]
+        jac[:, 1, 0] = dx[:, 1]
+        jac[:, 1, 1] = 1 + dy[:, 1]
+        jac[:, 1, 2] = dz[:, 1]
+        jac[:, 2, 0] = dx[:, 2]
+        jac[:, 2, 1] = dy[:, 2]
+        jac[:, 2, 2] = 1 + dz[:, 2]
+        det = torch.det(jac.permute(0, 3, 4, 5, 1, 2))
+        det = torch.nan_to_num(det, nan=1.0, posinf=1e3, neginf=-1e3)
+        det = det.clamp(min=self.det_clamp)
+        forward_term = (det - 1.0).abs().pow(self.power)
+        inverse_term = (1.0 / det - 1.0).abs().pow(self.power)
+        return (forward_term + inverse_term).mean()
+
+
 class NegativeJacobianLoss(nn.Module):
     def forward(self, displacement: torch.Tensor) -> torch.Tensor:
         dx = displacement[:, :, 1:, :-1, :-1] - displacement[:, :, :-1, :-1, :-1]
@@ -320,9 +385,13 @@ class RegistrationCriterion(nn.Module):
         multiscale_similarity_factors: list[int] | None = None,
         multiscale_similarity_weights: list[float] | None = None,
         lncc_window_size: int = 5,
+        lncc_windows: list[int] | None = None,
         segmentation_supervision_weight: float = 0.0,
+        per_stage_segmentation_weights: dict[int, float] | None = None,
         smoothness_weight: float = 0.02,
         jacobian_weight: float = 0.01,
+        hyperelastic_weight: float = 0.0,
+        hyperelastic_power: float = 2.0,
         inverse_consistency_weight: float = 0.1,
         correspondence_weight: float = 0.2,
         synthetic_matchability_weight: float = 0.25,
@@ -345,17 +414,23 @@ class RegistrationCriterion(nn.Module):
         self.segmentation_supervision_weight = segmentation_supervision_weight
         self.smoothness_weight = smoothness_weight
         self.jacobian_weight = jacobian_weight
+        self.hyperelastic_weight = float(hyperelastic_weight)
         self.inverse_consistency_weight = inverse_consistency_weight
         self.correspondence_weight = correspondence_weight
         self.synthetic_matchability_weight = synthetic_matchability_weight
         self.residual_velocity_weight = residual_velocity_weight
         self.decoder_fitting_weight = decoder_fitting_weight
         self.num_labels = num_labels
-        self.image_loss = LNCCLoss(window_size=lncc_window_size)
+        if lncc_windows:
+            self.image_loss = MultiWindowLNCCLoss(list(lncc_windows))
+        else:
+            self.image_loss = LNCCLoss(window_size=lncc_window_size)
         self.segmentation_loss = DiceLoss(num_class=num_labels)
         self.smoothness = Grad3D(penalty="l2")
         self.jacobian = NegativeJacobianLoss()
+        self.hyperelastic = HyperelasticRegularizer(power=hyperelastic_power)
         self.inverse_consistency = InverseConsistencyLoss(image_size)
+        self.inverse_consistency_half = InverseConsistencyLoss([s // 2 for s in image_size])
         self.correspondence_consistency = CorrespondenceConsistencyLoss()
         self.decoder_fitting = DecoderFittingLoss(
             detach_target=decoder_fitting_detach_target,
@@ -365,6 +440,18 @@ class RegistrationCriterion(nn.Module):
             margin_min=decoder_fitting_margin_min,
         )
         self.segmentation_transformer = SpatialTransformer(image_size)
+        half_size = [s // 2 for s in image_size]
+        self.segmentation_transformer_half = SpatialTransformer(half_size)
+        self.per_stage_segmentation_weights: dict[int, float] = {
+            int(stage_id): float(weight)
+            for stage_id, weight in (per_stage_segmentation_weights or {}).items()
+            if float(weight) > 0.0
+        }
+        self.per_stage_seg_transformers = nn.ModuleDict()
+        for stage_id in self.per_stage_segmentation_weights:
+            factor = 2 ** stage_id
+            stage_size = [max(1, s // factor) for s in image_size]
+            self.per_stage_seg_transformers[str(stage_id)] = SpatialTransformer(stage_size)
         self.synthetic_pointmap = SyntheticPointmapLoss()
         self.synthetic_descriptor = DescriptorContrastiveLoss()
         self.synthetic_matching = SyntheticMatchingLoss()
@@ -413,13 +500,75 @@ class RegistrationCriterion(nn.Module):
         ):
             return forward_disp.new_tensor(0.0)
 
-        source_onehot = get_one_hot(source_label, self.num_labels).float()
-        target_onehot = get_one_hot(target_label, self.num_labels).float()
-        warped_source = self.segmentation_transformer(source_onehot, forward_disp.float())
-        warped_target = self.segmentation_transformer(target_onehot, backward_disp.float())
-        forward_loss = self.segmentation_loss(warped_source, target_label.long())
-        backward_loss = self.segmentation_loss(warped_target, source_label.long())
+        interp_kw = dict(scale_factor=0.5, align_corners=False)
+        fwd_half = F.interpolate(forward_disp.float(), mode="trilinear", **interp_kw) * 0.5
+        bwd_half = F.interpolate(backward_disp.float(), mode="trilinear", **interp_kw) * 0.5
+        src_lbl_half = F.interpolate(source_label.float(), scale_factor=0.5, mode="nearest").long()
+        tgt_lbl_half = F.interpolate(target_label.float(), scale_factor=0.5, mode="nearest").long()
+        source_onehot = get_one_hot(src_lbl_half, self.num_labels).float()
+        target_onehot = get_one_hot(tgt_lbl_half, self.num_labels).float()
+        warped_source = self.segmentation_transformer_half(source_onehot, fwd_half)
+        warped_target = self.segmentation_transformer_half(target_onehot, bwd_half)
+        forward_loss = self.segmentation_loss(warped_source, tgt_lbl_half.long())
+        backward_loss = self.segmentation_loss(warped_target, src_lbl_half.long())
         return 0.5 * (forward_loss + backward_loss)
+
+    def _per_stage_segmentation(
+        self,
+        forward_stage_disps: dict[int, torch.Tensor] | None,
+        backward_stage_disps: dict[int, torch.Tensor] | None,
+        source_label: torch.Tensor | None,
+        target_label: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply Dice supervision at each stage's intermediate displacement.
+
+        Each stage k operates at resolution image_size / 2**k with displacements
+        already in that stage's voxel units, so labels are nearest-downsampled
+        to that resolution and warped with the stage's spatial transformer.
+        Bidirectional, returns a *weighted-summed* loss (not averaged) so the
+        per-stage weights act as direct loss multipliers.
+        """
+        if (
+            not self.per_stage_segmentation_weights
+            or source_label is None
+            or target_label is None
+            or forward_stage_disps is None
+            or backward_stage_disps is None
+        ):
+            reference = next(
+                iter((forward_stage_disps or {}).values()),
+                source_label if source_label is not None else None,
+            )
+            if reference is None:
+                return torch.zeros((), device=source_label.device if source_label is not None else "cpu")
+            return reference.new_tensor(0.0) if torch.is_tensor(reference) else torch.zeros(())
+
+        accumulated = None
+        for stage_id, weight in self.per_stage_segmentation_weights.items():
+            if stage_id not in forward_stage_disps or stage_id not in backward_stage_disps:
+                continue
+            transformer = self.per_stage_seg_transformers[str(stage_id)]
+            fwd_disp = forward_stage_disps[stage_id].float()
+            bwd_disp = backward_stage_disps[stage_id].float()
+            stage_size = tuple(fwd_disp.shape[2:])
+            src_lbl_stage = F.interpolate(
+                source_label.float(), size=stage_size, mode="nearest"
+            ).long()
+            tgt_lbl_stage = F.interpolate(
+                target_label.float(), size=stage_size, mode="nearest"
+            ).long()
+            source_onehot = get_one_hot(src_lbl_stage, self.num_labels).float()
+            target_onehot = get_one_hot(tgt_lbl_stage, self.num_labels).float()
+            warped_source = transformer(source_onehot, fwd_disp)
+            warped_target = transformer(target_onehot, bwd_disp)
+            forward_loss = self.segmentation_loss(warped_source, tgt_lbl_stage.long())
+            backward_loss = self.segmentation_loss(warped_target, src_lbl_stage.long())
+            stage_loss = 0.5 * (forward_loss + backward_loss) * float(weight)
+            accumulated = stage_loss if accumulated is None else accumulated + stage_loss
+        if accumulated is None:
+            reference = next(iter(forward_stage_disps.values()))
+            return reference.new_tensor(0.0)
+        return accumulated
 
     @staticmethod
     def _residual_velocity_penalty(*velocity_fields: torch.Tensor | None) -> torch.Tensor | None:
@@ -513,9 +662,22 @@ class RegistrationCriterion(nn.Module):
             source_label,
             target_label,
         )
-        smoothness = self.smoothness(forward_disp) + self.smoothness(backward_disp)
-        jacobian = self.jacobian(forward_disp) + self.jacobian(backward_disp)
-        inverse = self.inverse_consistency(forward_disp, backward_disp)
+        per_stage_segmentation = self._per_stage_segmentation(
+            model_outputs.get("forward_stage_displacements"),
+            model_outputs.get("backward_stage_displacements"),
+            source_label,
+            target_label,
+        )
+        _reg_kw = dict(scale_factor=0.5, mode="trilinear", align_corners=False)
+        fwd_reg = F.interpolate(forward_disp.float(), **_reg_kw) * 0.5
+        bwd_reg = F.interpolate(backward_disp.float(), **_reg_kw) * 0.5
+        smoothness = self.smoothness(fwd_reg) + self.smoothness(bwd_reg)
+        jacobian = self.jacobian(fwd_reg) + self.jacobian(bwd_reg)
+        if self.hyperelastic_weight > 0.0:
+            hyperelastic = self.hyperelastic(fwd_reg) + self.hyperelastic(bwd_reg)
+        else:
+            hyperelastic = forward_disp.new_tensor(0.0)
+        inverse = self.inverse_consistency_half(fwd_reg, bwd_reg)
         correspondence = self.correspondence_consistency(
             model_outputs["forward_matches"],
             model_outputs["backward_matches"],
@@ -540,8 +702,10 @@ class RegistrationCriterion(nn.Module):
         )
         similarity = torch.nan_to_num(similarity, nan=1.0, posinf=1e3, neginf=1e3)
         segmentation = torch.nan_to_num(segmentation, nan=0.0, posinf=1e3, neginf=0.0)
+        per_stage_segmentation = torch.nan_to_num(per_stage_segmentation, nan=0.0, posinf=1e3, neginf=0.0)
         smoothness = torch.nan_to_num(smoothness, nan=0.0, posinf=1e3, neginf=0.0)
         jacobian = torch.nan_to_num(jacobian, nan=0.0, posinf=1e3, neginf=0.0)
+        hyperelastic = torch.nan_to_num(hyperelastic, nan=0.0, posinf=1e3, neginf=0.0)
         inverse = torch.nan_to_num(inverse, nan=0.0, posinf=1e3, neginf=0.0)
         correspondence = torch.nan_to_num(correspondence, nan=0.0, posinf=1e3, neginf=0.0)
         decoder_fitting = torch.nan_to_num(decoder_fitting, nan=0.0, posinf=1e3, neginf=0.0)
@@ -551,8 +715,10 @@ class RegistrationCriterion(nn.Module):
         avg = (
             self.image_loss_weight * similarity
             + self.segmentation_supervision_weight * segmentation
+            + per_stage_segmentation
             + self.smoothness_weight * smoothness
             + self.jacobian_weight * jacobian
+            + self.hyperelastic_weight * hyperelastic
             + self.inverse_consistency_weight * inverse
             + self.correspondence_weight * correspondence
             + self.decoder_fitting_weight * decoder_fitting
@@ -562,8 +728,10 @@ class RegistrationCriterion(nn.Module):
         return {
             "image": similarity,
             "segmentation": segmentation,
+            "per_stage_segmentation": per_stage_segmentation,
             "smoothness": smoothness,
             "jacobian": jacobian,
+            "hyperelastic": hyperelastic,
             "inverse": inverse,
             "correspondence": correspondence,
             "decoder_fitting": decoder_fitting,

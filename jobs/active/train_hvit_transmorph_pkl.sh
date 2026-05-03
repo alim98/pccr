@@ -31,7 +31,7 @@ PYTHON_BIN="${PYTHON_BIN:-${ENV_PATH}/bin/python}"
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/hvit_transmorph_pkl.yaml}"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/All}"
 VAL_DATA_PATH="${VAL_DATA_PATH:-/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/Test}"
-LOGGER_BACKEND="${LOGGER_BACKEND:-csv}"
+LOGGER_BACKEND="${LOGGER_BACKEND:-aim,csv}"
 AIM_REPO="${AIM_REPO:-${REPO_ROOT}/aim}"
 PRECISION="${PRECISION:-bf16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -50,7 +50,7 @@ mkdir -p \
   "${REPO_ROOT}/slurm/output_hvit_tm_pkl" \
   "${REPO_ROOT}/slurm/error_hvit_tm_pkl" \
   "${REPO_ROOT}/logs/${EXPERIMENT_NAME}" \
-  "${REPO_ROOT}/checkpoints/${EXPERIMENT_NAME}" \
+  "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/${EXPERIMENT_NAME}" \
   "${AIM_REPO}"
 
 if command -v conda >/dev/null 2>&1; then
@@ -67,7 +67,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
 
-if [[ "${LOGGER_BACKEND}" == "aim" ]] && command -v aim >/dev/null 2>&1; then
+if [[ ",${LOGGER_BACKEND}," == *",aim,"* ]] && command -v aim >/dev/null 2>&1; then
   if [[ ! -d "${AIM_REPO}/.aim" ]]; then
     aim init --repo "${AIM_REPO}" >/dev/null 2>&1 || true
   fi

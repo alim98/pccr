@@ -25,6 +25,17 @@ from src.pccr.config import OASIS_L2R_EVAL_LABEL_IDS
 from src.pccr.utils import normalize_grid, voxel_grid
 
 
+def _loader_runtime_kwargs(num_workers: int) -> dict:
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
+    return kwargs
+
+
 class OASISSingleSubjectDataset(Dataset):
     def __init__(self, data_root: str, input_dim: list[int], dataset_variant: str = "default") -> None:
         data_path = Path(data_root)
@@ -268,7 +279,7 @@ def _sync_config_with_dataset_metadata(config, *datasets) -> None:
     if getattr(config, "dataset_variant", "default") == "oasis_l2r" and not config.eval_label_ids:
         config.eval_label_ids = list(OASIS_L2R_EVAL_LABEL_IDS)
     if dataset_num_labels:
-        config.num_labels = dataset_num_labels
+        config.num_labels = max(int(getattr(config, "num_labels", 0) or 0), dataset_num_labels)
 
 
 def create_real_pair_dataloaders(args, config):
@@ -323,7 +334,7 @@ def create_synthetic_dataloader(args, config):
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        **_loader_runtime_kwargs(args.num_workers),
     )
 
 
@@ -357,13 +368,13 @@ def create_synthetic_pair_dataloaders(args, config):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        **_loader_runtime_kwargs(args.num_workers),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        **_loader_runtime_kwargs(args.num_workers),
     )
     return train_loader, val_loader
 
@@ -441,12 +452,12 @@ def create_overfit_pair_dataloaders(args, config):
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        **_loader_runtime_kwargs(args.num_workers),
     )
     val_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        **_loader_runtime_kwargs(args.num_workers),
     )
     return train_loader, val_loader

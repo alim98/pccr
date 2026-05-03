@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.nn as nn
@@ -191,6 +192,14 @@ class LocalResidualMatcher(nn.Module):
         self.temperature = temperature
         self.memory_efficient = memory_efficient
         self.offset_chunk_size = max(1, int(offset_chunk_size))
+        # When this module is wrapped by an outer checkpoint in the decoder, we
+        # disable the inner chunk checkpoints to avoid duplicate recomputation.
+        self._outer_checkpoint_active = False
+        # Auto guard: keep inner chunk checkpointing for large tensors to avoid OOM
+        # during backward recomputation (notably full-size real training).
+        self._disable_inner_chunk_max_voxels = int(
+            os.getenv("PCCR_DISABLE_INNER_CHKPT_MAX_VOXELS", "2000000")
+        )
         self.proj_source = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
         self.proj_target = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
         offsets = [
@@ -211,6 +220,19 @@ class LocalResidualMatcher(nn.Module):
             nn.InstanceNorm3d(out_channels),
             nn.GELU(),
         )
+
+    def set_outer_checkpoint_active(self, active: bool) -> None:
+        self._outer_checkpoint_active = bool(active)
+
+    def _should_use_inner_chunk_checkpoint(self, spatial_shape: tuple[int, int, int]) -> bool:
+        if not (self.training and torch.is_grad_enabled()):
+            return False
+        if not self._outer_checkpoint_active:
+            return True
+        if self._disable_inner_chunk_max_voxels < 0:
+            return False
+        D, H, W = spatial_shape
+        return (D * H * W) > self._disable_inner_chunk_max_voxels
 
     @staticmethod
     def _conv3d_like(
@@ -254,8 +276,9 @@ class LocalResidualMatcher(nn.Module):
             start_idx: int,
             end_idx: int,
         ) -> torch.Tensor:
-            slices = []
-            for idx in range(start_idx, end_idx):
+            chunk_len = end_idx - start_idx
+            corr_chunk = source.new_empty(B, chunk_len, D, H, W)
+            for local_idx, idx in enumerate(range(start_idx, end_idx)):
                 dz, dy, dx = self.offsets[idx]
                 shifted = target[
                     :, :,
@@ -263,8 +286,7 @@ class LocalResidualMatcher(nn.Module):
                     radius + dy : radius + dy + H,
                     radius + dx : radius + dx + W,
                 ]
-                slices.append((source * shifted).sum(dim=1, keepdim=True))
-            corr_chunk = torch.cat(slices, dim=1)
+                corr_chunk[:, local_idx : local_idx + 1] = (source * shifted).sum(dim=1, keepdim=True)
             chunk_weight = first_conv.weight[:, start_idx : start_idx + corr_chunk.shape[1]]
             return self._conv3d_like(
                 corr_chunk,
@@ -273,9 +295,10 @@ class LocalResidualMatcher(nn.Module):
                 reference_conv=first_conv,
             )
 
+        use_inner_chunk_checkpoint = self._should_use_inner_chunk_checkpoint((D, H, W))
         for start_idx in range(0, num_offsets, chunk_size):
             end_idx = min(start_idx + chunk_size, num_offsets)
-            if self.training and torch.is_grad_enabled():
+            if use_inner_chunk_checkpoint:
                 hidden = hidden + checkpoint(
                     encode_offset_chunk,
                     source_proj,
@@ -303,8 +326,9 @@ class LocalResidualMatcher(nn.Module):
 
             for start_idx in range(0, num_offsets, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_offsets)
-                slices = []
-                for idx in range(start_idx, end_idx):
+                chunk_len = end_idx - start_idx
+                corr_chunk = stats_source.new_empty(B, chunk_len, D, H, W)
+                for local_idx, idx in enumerate(range(start_idx, end_idx)):
                     dz, dy, dx = self.offsets[idx]
                     shifted = stats_target[
                         :, :,
@@ -312,8 +336,10 @@ class LocalResidualMatcher(nn.Module):
                         radius + dy : radius + dy + H,
                         radius + dx : radius + dx + W,
                     ]
-                    slices.append((stats_source * shifted).sum(dim=1, keepdim=True))
-                corr_chunk = torch.cat(slices, dim=1)  # [B, K, D, H, W]
+                    corr_chunk[:, local_idx : local_idx + 1] = (
+                        stats_source * shifted
+                    ).sum(dim=1, keepdim=True)
+                # [B, K, D, H, W]
                 scaled_chunk = corr_chunk / T
 
                 # Merge top-2 of past (running_max, running_second_max) with chunk values.
@@ -477,6 +503,13 @@ class LocalCostVolumeEncoder(nn.Module):
         self.radius = radius
         self.memory_efficient = memory_efficient
         self.offset_chunk_size = max(1, offset_chunk_size)
+        # See LocalResidualMatcher: avoid nested chunk + outer checkpointing.
+        self._outer_checkpoint_active = False
+        # Auto guard: keep inner chunk checkpointing for large tensors to avoid OOM
+        # during backward recomputation (notably full-size real training).
+        self._disable_inner_chunk_max_voxels = int(
+            os.getenv("PCCR_DISABLE_INNER_CHKPT_MAX_VOXELS", "2000000")
+        )
         self.proj_source = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
         self.proj_target = nn.Conv3d(in_channels, proj_channels, kernel_size=1)
         num_offsets = (2 * radius + 1) ** 3
@@ -496,6 +529,19 @@ class LocalCostVolumeEncoder(nn.Module):
             nn.InstanceNorm3d(out_channels),
             nn.GELU(),
         )
+
+    def set_outer_checkpoint_active(self, active: bool) -> None:
+        self._outer_checkpoint_active = bool(active)
+
+    def _should_use_inner_chunk_checkpoint(self, spatial_shape: tuple[int, int, int]) -> bool:
+        if not (self.training and torch.is_grad_enabled()):
+            return False
+        if not self._outer_checkpoint_active:
+            return True
+        if self._disable_inner_chunk_max_voxels < 0:
+            return False
+        D, H, W = spatial_shape
+        return (D * H * W) > self._disable_inner_chunk_max_voxels
 
     @staticmethod
     def _conv3d_like(
@@ -582,8 +628,9 @@ class LocalCostVolumeEncoder(nn.Module):
             start_idx: int,
             end_idx: int,
         ) -> torch.Tensor:
-            chunk_values: list[torch.Tensor] = []
-            for offset_index in range(start_idx, end_idx):
+            chunk_len = end_idx - start_idx
+            correlation_chunk = source.new_empty(B, chunk_len, D, H, W)
+            for local_idx, offset_index in enumerate(range(start_idx, end_idx)):
                 dz, dy, dx = self.offsets[offset_index]
                 shifted = target[
                     :,
@@ -592,8 +639,9 @@ class LocalCostVolumeEncoder(nn.Module):
                     radius + dy : radius + dy + H,
                     radius + dx : radius + dx + W,
                 ]
-                chunk_values.append((source * shifted).sum(dim=1, keepdim=True))
-            correlation_chunk = torch.cat(chunk_values, dim=1)
+                correlation_chunk[:, local_idx : local_idx + 1] = (
+                    source * shifted
+                ).sum(dim=1, keepdim=True)
             chunk_weights = first_conv.weight[:, start_idx : start_idx + correlation_chunk.shape[1]]
             return self._conv3d_like(
                 correlation_chunk,
@@ -602,9 +650,10 @@ class LocalCostVolumeEncoder(nn.Module):
                 reference_conv=first_conv,
             )
 
+        use_inner_chunk_checkpoint = self._should_use_inner_chunk_checkpoint((D, H, W))
         for start_idx in range(0, num_offsets, chunk_size):
             end_idx = min(start_idx + chunk_size, num_offsets)
-            if self.training and torch.is_grad_enabled():
+            if use_inner_chunk_checkpoint:
                 hidden = hidden + checkpoint(
                     encode_offset_chunk,
                     source_proj,
@@ -629,8 +678,9 @@ class LocalCostVolumeEncoder(nn.Module):
 
             for start_idx in range(0, num_offsets, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_offsets)
-                slices: list[torch.Tensor] = []
-                for offset_index in range(start_idx, end_idx):
+                chunk_len = end_idx - start_idx
+                corr_chunk = stats_source.new_empty(B, chunk_len, D, H, W)
+                for local_idx, offset_index in enumerate(range(start_idx, end_idx)):
                     dz, dy, dx = self.offsets[offset_index]
                     shifted = stats_target[
                         :,
@@ -639,8 +689,10 @@ class LocalCostVolumeEncoder(nn.Module):
                         radius + dy : radius + dy + H,
                         radius + dx : radius + dx + W,
                     ]
-                    slices.append((stats_source * shifted).sum(dim=1, keepdim=True))
-                corr_chunk = torch.cat(slices, dim=1)  # [B, K, D, H, W]
+                    corr_chunk[:, local_idx : local_idx + 1] = (
+                        stats_source * shifted
+                    ).sum(dim=1, keepdim=True)
+                # [B, K, D, H, W]
 
                 chunk_max = corr_chunk.max(dim=1, keepdim=True).values
                 new_max = torch.maximum(running_max, chunk_max)
@@ -777,11 +829,15 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
         stage1_local_refinement_proj_channels: int = 16,
         stage1_local_refinement_feature_channels: int = 16,
         stage1_local_refinement_temperature: float = 1.0,
+        stage1_local_refinement_memory_efficient: bool = True,
+        stage1_local_refinement_offset_chunk_size: int = 32,
         use_stage2_local_refinement: bool = False,
         stage2_local_refinement_radius: int = 0,
         stage2_local_refinement_proj_channels: int = 16,
         stage2_local_refinement_feature_channels: int = 16,
         stage2_local_refinement_temperature: float = 1.0,
+        stage2_local_refinement_memory_efficient: bool = True,
+        stage2_local_refinement_offset_chunk_size: int = 32,
         use_gradient_checkpointing: bool = False,
         diagnostic_residual_only: bool = False,
     ) -> None:
@@ -821,6 +877,8 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 stage2_local_refinement_proj_channels,
                 stage2_local_refinement_feature_channels,
                 stage2_local_refinement_temperature,
+                stage2_local_refinement_memory_efficient,
+                stage2_local_refinement_offset_chunk_size,
             ),
             1: (
                 self.use_stage1_local_refinement,
@@ -828,14 +886,16 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                 stage1_local_refinement_proj_channels,
                 stage1_local_refinement_feature_channels,
                 stage1_local_refinement_temperature,
+                stage1_local_refinement_memory_efficient,
+                stage1_local_refinement_offset_chunk_size,
             ),
         }
         for stage_id in decoder_stage_ids:
             size = tuple(stage_sizes[stage_id])
             extra_channels = 0
-            enabled, radius, proj_channels, feature_channels, temperature = local_refinement_specs.get(
+            enabled, radius, proj_channels, feature_channels, temperature, memory_efficient, offset_chunk_size = local_refinement_specs.get(
                 stage_id,
-                (False, 0, 16, 16, 1.0),
+                (False, 0, 16, 16, 1.0, True, 32),
             )
             if enabled:
                 self.stage_local_refiners[str(stage_id)] = StageLocalCorrelationRefiner(
@@ -844,6 +904,8 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
                     proj_channels=proj_channels,
                     out_channels=feature_channels,
                     temperature=temperature,
+                    memory_efficient=memory_efficient,
+                    offset_chunk_size=offset_chunk_size,
                 )
                 extra_channels = feature_channels
             self.stage_decoders[str(stage_id)] = StageVelocityDecoder(
@@ -920,9 +982,26 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
             inputs.append(edge_diff)
         return torch.cat(inputs, dim=1)
 
+    @staticmethod
+    def _set_outer_checkpoint_flag(module: nn.Module, active: bool) -> None:
+        setter = getattr(module, "set_outer_checkpoint_active", None)
+        if callable(setter):
+            setter(active)
+
     def _run_tensor_module(self, module: nn.Module, *args: torch.Tensor) -> torch.Tensor:
-        if self.use_gradient_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(module, *args, use_reentrant=False)
+        use_outer_checkpoint = self.use_gradient_checkpointing and self.training and torch.is_grad_enabled()
+
+        if use_outer_checkpoint:
+            def forward_fn(*inputs: torch.Tensor) -> torch.Tensor:
+                self._set_outer_checkpoint_flag(module, True)
+                try:
+                    return module(*inputs)
+                finally:
+                    self._set_outer_checkpoint_flag(module, False)
+
+            return checkpoint(forward_fn, *args, use_reentrant=False)
+
+        self._set_outer_checkpoint_flag(module, False)
         return module(*args)
 
     def _run_local_refiner(
@@ -930,17 +1009,23 @@ class DiffeomorphicRegistrationDecoder(nn.Module):
         module: nn.Module,
         *args: torch.Tensor,
     ) -> LocalResidualMatchOutputs:
-        def forward_fn(*inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            outputs = module(*inputs)
-            return (
-                outputs.delta_displacement,
-                outputs.confidence,
-                outputs.margin,
-                outputs.entropy,
-                outputs.encoded_features,
-            )
+        use_outer_checkpoint = self.use_gradient_checkpointing and self.training and torch.is_grad_enabled()
 
-        if self.use_gradient_checkpointing and self.training and torch.is_grad_enabled():
+        def forward_fn(*inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            self._set_outer_checkpoint_flag(module, use_outer_checkpoint)
+            try:
+                outputs = module(*inputs)
+                return (
+                    outputs.delta_displacement,
+                    outputs.confidence,
+                    outputs.margin,
+                    outputs.entropy,
+                    outputs.encoded_features,
+                )
+            finally:
+                self._set_outer_checkpoint_flag(module, False)
+
+        if use_outer_checkpoint:
             delta_displacement, confidence, margin, entropy, encoded_features = checkpoint(
                 forward_fn,
                 *args,

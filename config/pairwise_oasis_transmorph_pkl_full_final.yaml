@@ -1,0 +1,74 @@
+base_config: ./pairwise_oasis_transmorph_pkl.yaml
+
+data_size:
+  - 160
+  - 192
+  - 224
+
+align_data_size_to_native_shape: false
+
+use_gradient_checkpointing: true
+use_amp: true
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# decoder fitting: make the decoder actually follow the matcher outputs
+# was 0.0 in all previous configs — this is why the correspondence branch was wasted
+decoder_fitting_weight: 0.1
+decoder_fitting_detach_target: true
+decoder_fitting_entropy_threshold: 0.9
+decoder_fitting_confidence_percentile: 0.5
+decoder_fitting_margin_power: 1.0
+decoder_fitting_margin_min: 0.0
+
+# direct segmentation supervision during real training
+# labels are in every batch but were never used — this puts a Dice gradient on the evaluation metric
+segmentation_supervision_weight: 0.05
+
+# image loss: multiscale LNCC, slightly upweighted, window=9 is correct at 160x192x224
+image_loss_weight: 1.25
+multiscale_similarity_factors:
+  - 1
+  - 2
+multiscale_similarity_weights:
+  - 1.0
+  - 0.25
+lncc_window_size: 9
+
+# rebalanced regularization: reduce terms that compete with image/seg loss
+# previous default: smoothness=0.02, jacobian=0.01, inverse=0.1, correspondence=0.2
+smoothness_weight: 0.01
+jacobian_weight: 0.005
+inverse_consistency_weight: 0.05
+correspondence_weight: 0.1
+residual_velocity_weight: 0.0
+
+final_refinement_hidden_channels: 32
+final_refinement_num_blocks: 2
+final_refinement_activation: leaky_relu
+final_refinement_max_velocity: 0.2
+final_refinement_include_raw_image_error_inputs: true
+final_refinement_use_image_error_inputs: false
+final_refinement_use_error_edges: false
+
+# matcher mode
+matchability_score_mode: soft
+matchability_score_power: 0.5
+
+# per-module lr scaling
+encoder_lr_scale: 1.0
+canonical_head_lr_scale: 1.0
+coarse_decoder_lr_scale: 1.0
+residual_refinement_lr_scale: 1.5
+
+# cosine decay with a floor so the model doesn't die at epoch 250+
+lr_min_ratio: 0.01
+
+# no freezing during warmup: start end-to-end immediately
+refinement_warmup_epochs: 0
+
+# stage and final local refinement settings — already in base, repeated here for clarity
+# stage 1 and 2 local correlation (radius=6) plus cost-volume final head (radius=8)
+# are inherited from pairwise_oasis_transmorph_pkl.yaml
+# stage 0 falls through to the final residual head — this is acceptable at full-res
+# because cost-volume radius=8 at 160x192x224 covers ~17-voxel neighborhood

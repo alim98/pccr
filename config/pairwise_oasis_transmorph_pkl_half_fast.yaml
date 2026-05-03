@@ -1,0 +1,17 @@
+base_config: ./pairwise_oasis_transmorph_pkl.yaml
+
+data_size:
+  - 80
+  - 96
+  - 112
+
+align_data_size_to_native_shape: false
+use_gradient_checkpointing: false
+batch_size: 1
+gradient_accumulation_steps: 1
+stage1_local_refinement_memory_efficient: false
+stage1_local_refinement_offset_chunk_size: 32
+stage2_local_refinement_memory_efficient: false
+stage2_local_refinement_offset_chunk_size: 32
+final_refinement_memory_efficient_cost_volume: false
+final_refinement_cost_volume_offset_chunk_size: 16

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from src.model.transformation import SpatialTransformer
 from src.pccr.modules.diffeomorphic import (
@@ -12,6 +13,7 @@ from src.pccr.modules.diffeomorphic import (
     FinalResidualRefinementHead,
     ImageErrorEncoder,
     LocalCostVolumeEncoder,
+    LocalResidualMatchOutputs,
     LocalResidualMatcher,
     ScalingAndSquaring,
     StageLocalCorrelationRefiner,
@@ -100,6 +102,8 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
         final_refinement_cost_volume_radius: int = 0,
         final_refinement_cost_volume_proj_channels: int = 16,
         final_refinement_cost_volume_feature_channels: int = 16,
+        final_refinement_memory_efficient_cost_volume: bool = False,
+        final_refinement_cost_volume_offset_chunk_size: int = 8,
         final_refinement_use_local_residual_matcher: bool = False,
         final_refinement_local_matcher_radius: int = 0,
         final_refinement_local_matcher_proj_channels: int = 16,
@@ -110,11 +114,22 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
         stage1_local_refinement_proj_channels: int = 16,
         stage1_local_refinement_feature_channels: int = 16,
         stage1_local_refinement_temperature: float = 1.0,
+        stage1_local_refinement_memory_efficient: bool = True,
+        stage1_local_refinement_offset_chunk_size: int = 32,
+        use_stage2_local_refinement: bool = False,
+        stage2_local_refinement_radius: int = 0,
+        stage2_local_refinement_proj_channels: int = 16,
+        stage2_local_refinement_feature_channels: int = 16,
+        stage2_local_refinement_temperature: float = 1.0,
+        stage2_local_refinement_memory_efficient: bool = True,
+        stage2_local_refinement_offset_chunk_size: int = 32,
         use_stage0_local_refinement: bool = False,
         stage0_local_refinement_radius: int = 0,
         stage0_local_refinement_proj_channels: int = 16,
         stage0_local_refinement_feature_channels: int = 16,
         stage0_local_refinement_temperature: float = 1.0,
+        stage0_local_refinement_memory_efficient: bool = True,
+        stage0_local_refinement_offset_chunk_size: int = 32,
         stage_local_refinement_gate_with_prior: bool = True,
         stage_local_refinement_prior_confidence_power: float = 0.5,
         use_structured_match_handoff: bool = False,
@@ -122,6 +137,7 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
         structured_match_handoff_channels: int = 16,
         structured_match_adapter_hidden_channels: int = 32,
         structured_match_adapter_velocity_scale: float = 0.25,
+        use_gradient_checkpointing: bool = False,
         diagnostic_residual_only: bool = False,
     ) -> None:
         super().__init__()
@@ -130,6 +146,7 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
         self.use_fine_local_refinement = use_fine_local_refinement
         self.use_final_residual_refinement = use_final_residual_refinement
         self.diagnostic_residual_only = diagnostic_residual_only
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.final_refinement_use_image_error_inputs = final_refinement_use_image_error_inputs
         self.final_refinement_include_raw_image_error_inputs = final_refinement_include_raw_image_error_inputs
         self.final_refinement_use_error_edges = final_refinement_use_error_edges
@@ -144,6 +161,7 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
             and final_refinement_local_matcher_radius > 0
         )
         self.use_stage1_local_refinement = use_stage1_local_refinement and stage1_local_refinement_radius > 0
+        self.use_stage2_local_refinement = use_stage2_local_refinement and stage2_local_refinement_radius > 0
         self.use_stage0_local_refinement = use_stage0_local_refinement and stage0_local_refinement_radius > 0
         self.stage_local_refinement_gate_with_prior = stage_local_refinement_gate_with_prior
         self.stage_local_refinement_prior_confidence_power = stage_local_refinement_prior_confidence_power
@@ -166,12 +184,23 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
 
         stage_sizes = self._stage_sizes(image_size, len(stage_channels))
         local_refinement_specs = {
+            2: (
+                self.use_stage2_local_refinement,
+                stage2_local_refinement_radius,
+                stage2_local_refinement_proj_channels,
+                stage2_local_refinement_feature_channels,
+                stage2_local_refinement_temperature,
+                stage2_local_refinement_memory_efficient,
+                stage2_local_refinement_offset_chunk_size,
+            ),
             1: (
                 self.use_stage1_local_refinement,
                 stage1_local_refinement_radius,
                 stage1_local_refinement_proj_channels,
                 stage1_local_refinement_feature_channels,
                 stage1_local_refinement_temperature,
+                stage1_local_refinement_memory_efficient,
+                stage1_local_refinement_offset_chunk_size,
             ),
             0: (
                 self.use_stage0_local_refinement,
@@ -179,6 +208,8 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                 stage0_local_refinement_proj_channels,
                 stage0_local_refinement_feature_channels,
                 stage0_local_refinement_temperature,
+                stage0_local_refinement_memory_efficient,
+                stage0_local_refinement_offset_chunk_size,
             ),
         }
         for stage_id in decoder_stage_ids:
@@ -194,9 +225,17 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                     hidden_channels=self.structured_match_adapter_hidden_channels,
                     max_velocity=max_velocity * self.structured_match_adapter_velocity_scale,
                 )
-            enabled, radius, proj_channels, feature_channels, temperature = local_refinement_specs.get(
+            (
+                enabled,
+                radius,
+                proj_channels,
+                feature_channels,
+                temperature,
+                memory_efficient,
+                offset_chunk_size,
+            ) = local_refinement_specs.get(
                 stage_id,
-                (False, 0, 16, 16, 1.0),
+                (False, 0, 16, 16, 1.0, True, 32),
             )
             if enabled:
                 self.stage_local_refiners[str(stage_id)] = StageLocalCorrelationRefiner(
@@ -205,6 +244,8 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                     proj_channels=proj_channels,
                     out_channels=feature_channels,
                     temperature=temperature,
+                    memory_efficient=memory_efficient,
+                    offset_chunk_size=offset_chunk_size,
                 )
                 self.stage_local_feature_channels[stage_id] = feature_channels
                 # Encoded local match features plus two scalar channels:
@@ -247,6 +288,8 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                     radius=final_refinement_cost_volume_radius,
                     proj_channels=final_refinement_cost_volume_proj_channels,
                     out_channels=final_refinement_cost_volume_feature_channels,
+                    memory_efficient=final_refinement_memory_efficient_cost_volume,
+                    offset_chunk_size=final_refinement_cost_volume_offset_chunk_size,
                 )
                 extra_channels += final_refinement_cost_volume_feature_channels
             self.final_refinement_head = FinalResidualRefinementHead(
@@ -291,6 +334,65 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
             ).abs()
             inputs.append(edge_diff)
         return torch.cat(inputs, dim=1)
+
+    @staticmethod
+    def _set_outer_checkpoint_flag(module: nn.Module, active: bool) -> None:
+        setter = getattr(module, "set_outer_checkpoint_active", None)
+        if callable(setter):
+            setter(active)
+
+    def _run_tensor_module(self, module: nn.Module, *args: torch.Tensor) -> torch.Tensor:
+        use_outer_checkpoint = self.use_gradient_checkpointing and self.training and torch.is_grad_enabled()
+
+        if use_outer_checkpoint:
+            def forward_fn(*inputs: torch.Tensor) -> torch.Tensor:
+                self._set_outer_checkpoint_flag(module, True)
+                try:
+                    return module(*inputs)
+                finally:
+                    self._set_outer_checkpoint_flag(module, False)
+
+            return checkpoint(forward_fn, *args, use_reentrant=False)
+
+        self._set_outer_checkpoint_flag(module, False)
+        return module(*args)
+
+    def _run_local_residual_matcher(
+        self,
+        module: nn.Module,
+        *args: torch.Tensor,
+    ) -> LocalResidualMatchOutputs:
+        use_outer_checkpoint = self.use_gradient_checkpointing and self.training and torch.is_grad_enabled()
+
+        def forward_fn(*inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            self._set_outer_checkpoint_flag(module, use_outer_checkpoint)
+            try:
+                outputs = module(*inputs)
+                return (
+                    outputs.delta_displacement,
+                    outputs.confidence,
+                    outputs.margin,
+                    outputs.entropy,
+                    outputs.encoded_features,
+                )
+            finally:
+                self._set_outer_checkpoint_flag(module, False)
+
+        if use_outer_checkpoint:
+            delta_displacement, confidence, margin, entropy, encoded_features = checkpoint(
+                forward_fn,
+                *args,
+                use_reentrant=False,
+            )
+        else:
+            delta_displacement, confidence, margin, entropy, encoded_features = forward_fn(*args)
+        return LocalResidualMatchOutputs(
+            delta_displacement=delta_displacement,
+            confidence=confidence,
+            margin=margin,
+            entropy=entropy,
+            encoded_features=encoded_features,
+        )
 
     def _build_local_refinement_context(
         self,
@@ -508,13 +610,14 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                     if previous_structured_evidence is not None:
                         stage_extra_features = previous_structured_evidence
 
-                velocity = self.stage_decoders[str(stage_id)](
+                velocity = self._run_tensor_module(
+                    self.stage_decoders[str(stage_id)],
                     source_stage,
                     warped_target,
                     raw_displacement,
                     confidence,
                     entropy,
-                    extra_features=stage_extra_features,
+                    stage_extra_features,
                 )
                 if self.use_structured_match_handoff:
                     if stage_structured_evidence is None and previous_structured_evidence is not None:
@@ -552,20 +655,20 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
         final_displacement = torch.nan_to_num(final_displacement, nan=0.0, posinf=0.0, neginf=0.0)
         if self.use_final_residual_refinement:
             source_fine = source_features[0]
-            target_fine = self.final_feature_transformer(target_features[0], final_displacement)
-            moved_source = self.final_transformer(source_image, final_displacement)
+            target_fine = self._run_tensor_module(self.final_feature_transformer, target_features[0], final_displacement)
+            moved_source = self._run_tensor_module(self.final_transformer, source_image, final_displacement)
             moved_source = torch.nan_to_num(moved_source, nan=0.0, posinf=0.0, neginf=0.0)
             extra_features = []
             if self.final_refinement_use_local_residual_matcher:
-                local_match_outputs = self.local_residual_matcher(source_fine, target_fine)
+                local_match_outputs = self._run_local_residual_matcher(self.local_residual_matcher, source_fine, target_fine)
                 final_displacement = compose_displacement_fields(
                     final_displacement,
                     local_match_outputs.delta_displacement,
                     self.final_transformer,
                 )
                 final_displacement = torch.nan_to_num(final_displacement, nan=0.0, posinf=0.0, neginf=0.0)
-                target_fine = self.final_feature_transformer(target_features[0], final_displacement)
-                moved_source = self.final_transformer(source_image, final_displacement)
+                target_fine = self._run_tensor_module(self.final_feature_transformer, target_features[0], final_displacement)
+                moved_source = self._run_tensor_module(self.final_transformer, source_image, final_displacement)
                 moved_source = torch.nan_to_num(moved_source, nan=0.0, posinf=0.0, neginf=0.0)
                 confidence = local_match_outputs.confidence
                 entropy = local_match_outputs.entropy
@@ -590,16 +693,17 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                     )
                 )
             if self.final_refinement_use_image_error_inputs:
-                extra_features.append(self.image_error_encoder(moved_source, target_image))
+                extra_features.append(self._run_tensor_module(self.image_error_encoder, moved_source, target_image))
             if self.final_refinement_use_local_cost_volume:
-                extra_features.append(self.local_cost_volume_encoder(source_fine, target_fine))
-            residual_velocity = self.final_refinement_head(
+                extra_features.append(self._run_tensor_module(self.local_cost_volume_encoder, source_fine, target_fine))
+            residual_velocity = self._run_tensor_module(
+                self.final_refinement_head,
                 source_fine,
                 target_fine,
                 final_displacement,
                 confidence,
                 entropy,
-                extra_features=torch.cat(extra_features, dim=1) if extra_features else None,
+                torch.cat(extra_features, dim=1) if extra_features else None,
             )
             if self.use_structured_match_handoff:
                 if previous_structured_evidence is None:
@@ -630,7 +734,7 @@ class DiffeomorphicRegistrationDecoderV6(nn.Module):
                 self.final_transformer,
             )
             final_displacement = torch.nan_to_num(final_displacement, nan=0.0, posinf=0.0, neginf=0.0)
-        moved_source = self.final_transformer(source_image, final_displacement)
+        moved_source = self._run_tensor_module(self.final_transformer, source_image, final_displacement)
         moved_source = torch.nan_to_num(moved_source, nan=0.0, posinf=0.0, neginf=0.0)
         return DecoderOutputs(
             displacement=final_displacement,

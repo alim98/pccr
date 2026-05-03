@@ -86,7 +86,7 @@ mkdir -p \
   "${REPO_ROOT}/slurm/output_pccr" \
   "${REPO_ROOT}/slurm/error_pccr" \
   "${REPO_ROOT}/logs/pccr/${EXPERIMENT_NAME}" \
-  "${REPO_ROOT}/checkpoints/pccr/${EXPERIMENT_NAME}" \
+  "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${EXPERIMENT_NAME}" \
   "${AIM_REPO}"
 
 if command -v conda >/dev/null 2>&1; then

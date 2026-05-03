@@ -65,8 +65,8 @@ stage1_local_refinement_temperature: 1.0
 use_final_residual_refinement: true
 final_refinement_use_local_cost_volume: true
 final_refinement_cost_volume_radius: 8
-final_refinement_cost_volume_proj_channels: 16
-final_refinement_cost_volume_feature_channels: 16
+final_refinement_cost_volume_proj_channels: 8
+final_refinement_cost_volume_feature_channels: 8
 final_refinement_memory_efficient_cost_volume: true
 final_refinement_cost_volume_offset_chunk_size: 8
 

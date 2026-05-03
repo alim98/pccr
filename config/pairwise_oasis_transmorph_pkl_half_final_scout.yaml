@@ -1,0 +1,24 @@
+base_config: ./pairwise_oasis_transmorph_pkl_full_final.yaml
+
+# Half-resolution scout: validates all loss fixes in ~4 days instead of ~50 days.
+# If val_dice passes 0.79+ (vs current best 0.7618), the config is confirmed correct.
+# Then commit to the full-res main run without fear of wasting 2 months.
+
+data_size:
+  - 80
+  - 96
+  - 112
+
+align_data_size_to_native_shape: false
+
+# Half-res fits in memory without any of these tricks
+use_gradient_checkpointing: false
+gradient_accumulation_steps: 1
+
+# Local refiners do not need streaming at half-res
+stage1_local_refinement_memory_efficient: false
+stage1_local_refinement_offset_chunk_size: 32
+stage2_local_refinement_memory_efficient: false
+stage2_local_refinement_offset_chunk_size: 32
+final_refinement_memory_efficient_cost_volume: false
+final_refinement_cost_volume_offset_chunk_size: 16

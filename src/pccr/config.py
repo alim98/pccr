@@ -96,23 +96,32 @@ class PCCRConfig:
     stage1_local_refinement_proj_channels: int = 16
     stage1_local_refinement_feature_channels: int = 16
     stage1_local_refinement_temperature: float = 1.0
+    stage1_local_refinement_memory_efficient: bool = True
+    stage1_local_refinement_offset_chunk_size: int = 32
     use_stage2_local_refinement: bool = False
     stage2_local_refinement_radius: int = 0
     stage2_local_refinement_proj_channels: int = 16
     stage2_local_refinement_feature_channels: int = 16
     stage2_local_refinement_temperature: float = 1.0
+    stage2_local_refinement_memory_efficient: bool = True
+    stage2_local_refinement_offset_chunk_size: int = 32
     use_amp: bool = True
     use_gradient_checkpointing: bool = False
     batch_size: int = 1
     gradient_accumulation_steps: int = 1
     image_loss: str = "lncc"
     lncc_window_size: int = 5
+    lncc_windows: list[int] | None = None
     multiscale_similarity_factors: list[int] = field(default_factory=lambda: [1])
     multiscale_similarity_weights: list[float] = field(default_factory=lambda: [1.0])
     image_loss_weight: float = 1.0
     segmentation_supervision_weight: float = 0.0
+    per_stage_segmentation_weights: dict[int, float] = field(default_factory=dict)
     smoothness_weight: float = 0.02
     jacobian_weight: float = 0.01
+    hyperelastic_weight: float = 0.0
+    hyperelastic_power: float = 2.0
+    symmetric_inference: bool = False
     inverse_consistency_weight: float = 0.1
     correspondence_weight: float = 0.2
     synthetic_matchability_weight: float = 0.25

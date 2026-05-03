@@ -1,0 +1,115 @@
+# PCCR v7 — final, last-shot configuration.
+#
+# Inherits the proven v5 architecture line (full-res 160x192x224, all v5
+# arch knobs identical). The architecture is byte-for-byte compatible with
+# v5 checkpoints — warm-start loads strict=True with no shape mismatch.
+#
+# Five surgical loss / supervision changes vs v5:
+#   1. Multi-window LNCC                  windows=[5,9,13]
+#      Smaller windows respond to small structures (hippocampus / amygdala),
+#      larger windows stabilise cortical alignment. The mean of the three
+#      replaces the single window-9 used by v5.
+#
+#   2. Per-stage Dice supervision         {1: 0.10, 2: 0.05}
+#      Adds direct anatomical gradient on the matcher's intermediate
+#      displacements at half- and quarter-resolution, in addition to the
+#      existing final-φ Dice. Net seg budget rises 0.20 → 0.35 spread
+#      across three resolutions.
+#
+#   3. Hyperelastic regularizer           weight=0.005, power=2.0
+#      Penalises  (det(J)-1)^2 + (1/det(J)-1)^2  symmetrically, so volume
+#      compression and expansion are equally discouraged. This drops SDlogJ
+#      without trading away dice — the lever LapIRN uses to keep SDlogJ at
+#      0.072 vs H-ViT's 0.539. We also shave the L2 grad smoothness to 0.012
+#      so the two regularizers don't fight.
+#
+#   4. Symmetric inverse-consistent inference at val/test only.
+#      val_dice now uses 0.5 * (φ_s2t - φ_t2s ∘ φ_s2t). Free 0.2-0.5pp at
+#      eval; no training cost.
+#
+#   5. Slightly longer LR warmup          5 → 8 epochs
+#      The new losses change the loss landscape; an extra 3 warmup epochs
+#      protects the warm-started weights from a sudden gradient regime.
+
+base_config: ./pairwise_oasis_transmorph_pkl_full_final.yaml
+
+data_size:
+  - 160
+  - 192
+  - 224
+
+# ── architecture: identical to v5 (do NOT change anything that resizes weights) ──
+final_refinement_cost_volume_proj_channels: 8
+final_refinement_cost_volume_feature_channels: 8
+
+# ── (1) multi-window LNCC ──
+lncc_windows:
+  - 5
+  - 9
+  - 13
+# multiscale_similarity_factors / weights inherited from full_final ([1, 2] / [1.0, 0.25]).
+
+# ── (2) per-stage Dice supervision ──
+# v5 keeps segmentation_supervision_weight=0.20 on the half-res final φ.
+# v7 adds intermediate-stage Dice on the model.forward_stage_displacements:
+#   stage 1 (half-res, 80x96x112): weight 0.10  → matcher + coarse decoder gradient
+#   stage 2 (quarter-res, 40x48x56): weight 0.05 → pointmap branch gradient
+# Net seg budget: 0.20 + 0.10 + 0.05 = 0.35 (vs 0.20 in v5, ~1.75x stronger).
+segmentation_supervision_weight: 0.20
+per_stage_segmentation_weights:
+  1: 0.10
+  2: 0.05
+
+# ── (3) hyperelastic regularization ──
+# Penalise det(J) deviation from 1 symmetrically. Replaces ~half the smoothness
+# budget; the L2 grad term remains for high-frequency damping.
+smoothness_weight: 0.012
+jacobian_weight: 0.005
+hyperelastic_weight: 0.005
+hyperelastic_power: 2.0
+
+# ── (4) symmetric inverse-consistent inference (val/test only) ──
+symmetric_inference: true
+
+# ── unchanged: inverse-consistency / correspondence / decoder-fitting ──
+inverse_consistency_weight: 0.05
+correspondence_weight: 0.1
+decoder_fitting_weight: 0.1
+decoder_fitting_detach_target: true
+decoder_fitting_entropy_threshold: 0.9
+decoder_fitting_confidence_percentile: 0.5
+decoder_fitting_margin_power: 1.0
+decoder_fitting_margin_min: 0.0
+
+# ── (5) LR schedule ──
+lr_scheduler: cosine
+lr_warmup_epochs: 8
+lr_min_ratio: 0.01
+
+# per-module LR scaling (same as v5: refinement gets 1.5x to keep the
+# residual head responsive to the new gradients)
+encoder_lr_scale: 1.0
+canonical_head_lr_scale: 1.0
+coarse_decoder_lr_scale: 1.0
+residual_refinement_lr_scale: 1.5
+
+# ── infrastructure (must match v5 so warm-start is strict) ──
+use_gradient_checkpointing: true
+use_amp: true
+batch_size: 1
+gradient_accumulation_steps: 4   # overridden to 1 by the 4-node launcher
+
+matchability_score_mode: soft
+matchability_score_power: 0.5
+
+residual_velocity_weight: 0.0
+
+final_refinement_hidden_channels: 32
+final_refinement_num_blocks: 2
+final_refinement_activation: leaky_relu
+final_refinement_max_velocity: 0.2
+final_refinement_include_raw_image_error_inputs: true
+final_refinement_use_image_error_inputs: false
+final_refinement_use_error_edges: false
+
+refinement_warmup_epochs: 0

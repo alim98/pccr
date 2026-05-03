@@ -30,7 +30,7 @@ ENV_PATH="${ENV_PATH:-/nexus/posix0/MBR-neuralsystems/alim/envs/hvit}"
 PYTHON_BIN="${PYTHON_BIN:-${ENV_PATH}/bin/python}"
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/pairwise_oasis_fullres.yaml}"
 DATA_ROOT="${DATA_ROOT:-/nexus/posix0/MBR-neuralsystems/alim/regdata/oasis_l2r}"
-LOGGER_BACKEND="${LOGGER_BACKEND:-csv}"
+LOGGER_BACKEND="${LOGGER_BACKEND:-aim,csv}"
 AIM_REPO="${AIM_REPO:-${REPO_ROOT}/aim}"
 PRECISION="${PRECISION:-bf16-mixed}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -105,8 +105,8 @@ mkdir -p \
   "${REPO_ROOT}/slurm/error_pccr_80x96x112" \
   "${REPO_ROOT}/logs/pccr/${PHASE1_EXPERIMENT}" \
   "${REPO_ROOT}/logs/pccr/${PHASE2_EXPERIMENT}" \
-  "${REPO_ROOT}/checkpoints/pccr/${PHASE1_EXPERIMENT}" \
-  "${REPO_ROOT}/checkpoints/pccr/${PHASE2_EXPERIMENT}" \
+  "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${PHASE1_EXPERIMENT}" \
+  "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${PHASE2_EXPERIMENT}" \
   "${AIM_REPO}"
 
 if command -v conda >/dev/null 2>&1; then
@@ -124,7 +124,7 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-if [[ "${LOGGER_BACKEND}" == "aim" ]] && command -v aim >/dev/null 2>&1; then
+if [[ ",${LOGGER_BACKEND}," == *",aim,"* ]] && command -v aim >/dev/null 2>&1; then
   if [[ ! -d "${AIM_REPO}/.aim" ]]; then
     aim init --repo "${AIM_REPO}" >/dev/null 2>&1 || true
   fi
@@ -247,7 +247,7 @@ run_phase2() {
   run_with_srun "${cmd[@]}"
 }
 
-PHASE1_CHECKPOINT="${PHASE1_CHECKPOINT_OVERRIDE:-${REPO_ROOT}/checkpoints/pccr/${PHASE1_EXPERIMENT}/last.ckpt}"
+PHASE1_CHECKPOINT="${PHASE1_CHECKPOINT_OVERRIDE:-/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${PHASE1_EXPERIMENT}/last.ckpt}"
 
 echo "[train_pccr_80x96x112.sh] Repository: ${REPO_ROOT}"
 echo "[train_pccr_80x96x112.sh] Environment: ${ENV_PATH}"

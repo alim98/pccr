@@ -33,7 +33,7 @@ CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/pairwise_oasis_transmorph_pkl.ya
 PHASE="${PHASE:-real}"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/All}"
 VAL_DATA_PATH="${VAL_DATA_PATH:-/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/Test}"
-LOGGER_BACKEND="${LOGGER_BACKEND:-csv}"
+LOGGER_BACKEND="${LOGGER_BACKEND:-aim,csv}"
 AIM_REPO="${AIM_REPO:-${REPO_ROOT}/aim}"
 DDP_FIND_UNUSED_PARAMETERS="${DDP_FIND_UNUSED_PARAMETERS:-auto}"
 PRECISION="${PRECISION:-bf16-mixed}"
@@ -52,7 +52,14 @@ FINAL_COST_VOLUME_RADIUS="${FINAL_COST_VOLUME_RADIUS:-8}"
 FINAL_COST_VOLUME_CHUNK_SIZE="${FINAL_COST_VOLUME_CHUNK_SIZE:-16}"
 RUN_TAG="${RUN_TAG:-$(date +"%Y%m%d-%H%M%S")}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-pccr_transmorph_pkl_${RUN_TAG}}"
+PCCR_CHECKPOINT_DIR="${PCCR_CHECKPOINT_DIR:-/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${EXPERIMENT_NAME}}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+AIM_RUN_NAME="${AIM_RUN_NAME:-${EXPERIMENT_NAME}}"
+AIM_RUN_HASH_FILE="${AIM_RUN_HASH_FILE:-${REPO_ROOT}/logs/pccr/${EXPERIMENT_NAME}/aim_run_hash.txt}"
+AIM_RUN_HASH="${AIM_RUN_HASH:-}"
+if [[ -z "${AIM_RUN_HASH}" && -s "${AIM_RUN_HASH_FILE}" ]]; then
+  AIM_RUN_HASH="$(head -n 1 "${AIM_RUN_HASH_FILE}" | tr -d '[:space:]')"
+fi
 
 EXTRA_ARGS=("$@")
 
@@ -60,7 +67,7 @@ mkdir -p \
   "${REPO_ROOT}/slurm/output_pccr_tm_pkl" \
   "${REPO_ROOT}/slurm/error_pccr_tm_pkl" \
   "${REPO_ROOT}/logs/pccr/${EXPERIMENT_NAME}" \
-  "${REPO_ROOT}/checkpoints/pccr/${EXPERIMENT_NAME}" \
+  "${PCCR_CHECKPOINT_DIR}" \
   "${AIM_REPO}"
 
 if command -v conda >/dev/null 2>&1; then
@@ -77,7 +84,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
 
-if [[ "${LOGGER_BACKEND}" == "aim" ]] && command -v aim >/dev/null 2>&1; then
+if [[ ",${LOGGER_BACKEND}," == *",aim,"* ]] && command -v aim >/dev/null 2>&1; then
   if [[ ! -d "${AIM_REPO}/.aim" ]]; then
     aim init --repo "${AIM_REPO}" >/dev/null 2>&1 || true
   fi
@@ -130,9 +137,12 @@ CMD=(
   --accelerator gpu
   --num_gpus "${NUM_GPUS_PER_NODE}"
   --experiment_name "${EXPERIMENT_NAME}"
+  --checkpoint_dir "${PCCR_CHECKPOINT_DIR}"
   --ddp_find_unused_parameters "${DDP_FIND_UNUSED_PARAMETERS}"
   --logger_backend "${LOGGER_BACKEND}"
   --aim_repo "${AIM_REPO}"
+  --run_name "${AIM_RUN_NAME}"
+  --aim_run_hash_file "${AIM_RUN_HASH_FILE}"
   --batch_size "${BATCH_SIZE}"
   --num_workers "${NUM_WORKERS}"
   --train_num_steps "${TRAIN_NUM_STEPS}"
@@ -145,6 +155,10 @@ CMD=(
   --log_every_n_steps "${LOG_EVERY_N_STEPS}"
   --max_val_pairs "${MAX_VAL_PAIRS}"
 )
+
+if [[ -n "${AIM_RUN_HASH}" ]]; then
+  CMD+=(--aim_run_hash "${AIM_RUN_HASH}")
+fi
 
 for override in "${COMMON_OVERRIDES[@]}"; do
   CMD+=(--config_override "${override}")
@@ -163,6 +177,8 @@ echo "[train_pccr_transmorph_pkl.sh] Phase: ${PHASE}"
 echo "[train_pccr_transmorph_pkl.sh] Train data: ${TRAIN_DATA_PATH}"
 echo "[train_pccr_transmorph_pkl.sh] Val data: ${VAL_DATA_PATH}"
 echo "[train_pccr_transmorph_pkl.sh] Experiment: ${EXPERIMENT_NAME}"
+echo "[train_pccr_transmorph_pkl.sh] Checkpoints: ${PCCR_CHECKPOINT_DIR}"
+echo "[train_pccr_transmorph_pkl.sh] Aim run: ${AIM_RUN_NAME} (${AIM_RUN_HASH:-new})"
 echo "[train_pccr_transmorph_pkl.sh] Final cost volume mode: ${FINAL_COST_VOLUME_MODE} (radius=${FINAL_COST_VOLUME_RADIUS}, chunk_size=${FINAL_COST_VOLUME_CHUNK_SIZE})"
 printf '[train_pccr_transmorph_pkl.sh] Command:'
 printf ' %q' "${CMD[@]}"

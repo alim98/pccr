@@ -36,9 +36,13 @@ class LiTPCCR(LightningModule):
             multiscale_similarity_factors=config.multiscale_similarity_factors,
             multiscale_similarity_weights=config.multiscale_similarity_weights,
             lncc_window_size=config.lncc_window_size,
+            lncc_windows=getattr(config, "lncc_windows", None),
             segmentation_supervision_weight=config.segmentation_supervision_weight,
+            per_stage_segmentation_weights=getattr(config, "per_stage_segmentation_weights", None),
             smoothness_weight=config.smoothness_weight,
             jacobian_weight=config.jacobian_weight,
+            hyperelastic_weight=getattr(config, "hyperelastic_weight", 0.0),
+            hyperelastic_power=getattr(config, "hyperelastic_power", 2.0),
             inverse_consistency_weight=config.inverse_consistency_weight,
             correspondence_weight=config.correspondence_weight,
             synthetic_matchability_weight=config.synthetic_matchability_weight,
@@ -60,28 +64,45 @@ class LiTPCCR(LightningModule):
         elif self.args.phase == "real" and self.config.refinement_warmup_epochs > 0:
             self._freeze_encoder_and_canonical_heads()
 
-    def _log_metrics(self, metrics: dict[str, float | torch.Tensor], step: int | None = None):
+    def _iter_experiment_loggers(self):
         if self.experiment_logger is None:
+            return []
+        if isinstance(self.experiment_logger, (list, tuple)):
+            return [logger for logger in self.experiment_logger if logger is not None]
+        return [self.experiment_logger]
+
+    def _log_metrics(self, metrics: dict[str, float | torch.Tensor], step: int | None = None):
+        if getattr(self, "global_rank", 0) != 0:
+            return
+        loggers = self._iter_experiment_loggers()
+        if not loggers:
             return
         serialized = {
             key: value.item() if isinstance(value, torch.Tensor) else value
             for key, value in metrics.items()
         }
-        self.experiment_logger.log_metrics(serialized, step=step)
+        for logger in loggers:
+            log_metrics = getattr(logger, "log_metrics", None)
+            if callable(log_metrics):
+                log_metrics(serialized, step=step)
 
     def log_aim_image(self, image: np.ndarray, name: str, step: int | None = None, context: dict | None = None) -> bool:
-        if self.experiment_logger is None:
+        loggers = self._iter_experiment_loggers()
+        if not loggers:
             return False
 
         run = None
-        for candidate in (
-            getattr(self.experiment_logger, "experiment", None),
-            getattr(self.experiment_logger, "_run", None),
-            getattr(self.experiment_logger, "run", None),
-            self.experiment_logger,
-        ):
-            if candidate is not None and hasattr(candidate, "track"):
-                run = candidate
+        for logger in loggers:
+            for candidate in (
+                getattr(logger, "experiment", None),
+                getattr(logger, "_run", None),
+                getattr(logger, "run", None),
+                logger,
+            ):
+                if candidate is not None and hasattr(candidate, "track"):
+                    run = candidate
+                    break
+            if run is not None:
                 break
         if run is None:
             return False
@@ -306,26 +327,28 @@ class LiTPCCR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         _, losses, _, _ = self._compute_loss(batch)
-        self.log("train_loss", losses["avg_loss"], prog_bar=True, on_epoch=True, on_step=True)
-        self._log_metrics({f"train_{k}": v for k, v in losses.items()}, step=self.global_step)
+        self.log("train_loss", losses["avg_loss"], prog_bar=True, on_epoch=True, on_step=True, sync_dist=True)
+        for name, value in losses.items():
+            self.log(f"train_{name}", value, prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
         return losses["avg_loss"]
 
     def validation_step(self, batch, batch_idx):
         outputs, losses, source_label, target_label = self._compute_loss(batch)
         for name, value in losses.items():
-            self.log(f"val_{name}", value, prog_bar=name == "avg_loss", on_step=False, on_epoch=True)
+            self.log(f"val_{name}", value, prog_bar=name == "avg_loss", on_step=False, on_epoch=True, sync_dist=True)
 
         if self.args.phase != "synthetic":
             score = self._dice_from_outputs(outputs, source_label, target_label)
-            self.log("val_dice", score.mean(), prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_dice", score.mean(), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
             jacobian_metrics = jacobian_statistics(outputs["phi_s2t"])
-            self.log("val_sdlogj", jacobian_metrics["sdlogj"], prog_bar=False, on_step=False, on_epoch=True)
+            self.log("val_sdlogj", jacobian_metrics["sdlogj"], prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
             self.log(
                 "val_nonpositive_jacobian_fraction",
                 jacobian_metrics["jacobian_nonpositive_fraction"],
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
+                sync_dist=True,
             )
             self.log(
                 "val_nonpositive_jacobian_percent",
@@ -333,45 +356,39 @@ class LiTPCCR(LightningModule):
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
+                sync_dist=True,
             )
-            self._log_metrics({"val_dice": score.mean()}, step=self.global_step)
-            self._log_metrics(
-                {
-                    "val_sdlogj": jacobian_metrics["sdlogj"],
-                    "val_nonpositive_jacobian_fraction": jacobian_metrics["jacobian_nonpositive_fraction"],
-                    "val_nonpositive_jacobian_percent": jacobian_metrics["jacobian_nonpositive_fraction"] * 100.0,
-                },
-                step=self.global_step,
-            )
-
-        self._log_metrics({f"val_{k}": v for k, v in losses.items()}, step=self.global_step)
         return losses["avg_loss"]
 
     def test_step(self, batch, batch_idx):
         outputs, _, source_label, target_label = self._compute_loss(batch)
         score = self._dice_from_outputs(outputs, source_label, target_label).mean()
         self.test_outputs.append(score)
-        self.log("test_dice", score, prog_bar=True, on_epoch=True, on_step=False)
-        self._log_metrics({"test_dice": score}, step=self.global_step)
+        self.log("test_dice", score, prog_bar=True, on_epoch=True, on_step=False, sync_dist=True)
         return score
 
     def on_test_epoch_end(self):
         if not self.test_outputs:
             return
         avg_score = torch.stack(self.test_outputs).mean()
-        self.log("avg_test_dice", avg_score, prog_bar=True)
-        self._log_metrics({"avg_test_dice": avg_score}, step=self.global_step)
+        self.log("avg_test_dice", avg_score, prog_bar=True, sync_dist=True)
         self.test_outputs.clear()
 
     def _dice_from_outputs(self, outputs, source_label, target_label):
-        forward_disp = outputs["phi_s2t"]
+        forward_disp = outputs["phi_s2t"].float()
+        if getattr(self.config, "symmetric_inference", False):
+            # Inverse-consistent symmetric warp: average φ_s2t with the inverse
+            # of φ_t2s expressed in the source frame, i.e. -(φ_t2s ∘ φ_s2t).
+            backward_disp = outputs["phi_t2s"].float()
+            composed = self.model.decoder.final_transformer(backward_disp, forward_disp)
+            forward_disp = 0.5 * (forward_disp - composed)
         source_onehot = get_one_hot(source_label, self.config.num_labels)
         warped_channels = []
         for channel_id in range(self.config.num_labels):
             warped_channels.append(
                 self.model.decoder.final_transformer(
                     source_onehot[:, channel_id : channel_id + 1].float(),
-                    forward_disp.float(),
+                    forward_disp,
                 )
             )
         warped_seg = torch.cat(warped_channels, dim=1)

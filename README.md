@@ -74,7 +74,7 @@ To run inference using a trained model:
 
 ```
 python src/scripts/main.py --mode inference \
-    --checkpoint_path ./checkpoints/2024-09-12_17-42-10/model_epoch_10.ckpt \
+    --checkpoint_path /nexus/posix0/MBR-neuralsystems/alim/experiments_pccr/checkpoints/2024-09-12_17-42-10/model_epoch_10.ckpt \
     --test_data_path ./path/to/your/test \
     --batch_size 1 \
     --num_gpus 1 \

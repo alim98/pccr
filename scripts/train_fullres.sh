@@ -23,7 +23,7 @@ MEMORY_WARNING_RATIO="${MEMORY_WARNING_RATIO:-0.9}"
 
 EXTRA_ARGS=("$@")
 
-mkdir -p "${REPO_ROOT}/logs/pccr" "${REPO_ROOT}/checkpoints/pccr" "${AIM_REPO}"
+mkdir -p "${REPO_ROOT}/logs/pccr" "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr" "${AIM_REPO}"
 
 if command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
@@ -214,7 +214,7 @@ echo "[train_fullres.sh] Resolution log: ${RESOLUTION_LOG}"
 PHASE1_EXPERIMENT="${EXPERIMENT_NAME}_phase1_synth_${RESOLUTION_TAG}"
 PHASE2_EXPERIMENT="${EXPERIMENT_NAME}_phase2_real_${RESOLUTION_TAG}"
 run_phase1 "${SELECTED_RESOLUTION}" "${PHASE1_EXPERIMENT}"
-PHASE1_CHECKPOINT="${REPO_ROOT}/checkpoints/pccr/${PHASE1_EXPERIMENT}/last.ckpt"
+PHASE1_CHECKPOINT="/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${PHASE1_EXPERIMENT}/last.ckpt"
 if [[ ! -f "${PHASE1_CHECKPOINT}" ]]; then
   echo "[train_fullres.sh] Expected Phase 1 checkpoint not found: ${PHASE1_CHECKPOINT}" >&2
   exit 1

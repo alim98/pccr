@@ -31,3 +31,9 @@ claude/
 # jobs/
 results/
 third_party/
+
+docs/
+symlinks/
+tmp
+misc/eta
+success/

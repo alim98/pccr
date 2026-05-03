@@ -141,7 +141,7 @@ Run:
 - job `26076464`
 - experiment `pccr_v6a_stage0_handoff_ov10_20260405-153125`
 - overfit-10 validation subset
-- initialized from `checkpoints/pccr/pccr_oasis_real_20260329-100814/epoch1365-val1.5977.ckpt`
+- initialized from `/nexus/posix0/MBR-neuralsystems/alim/experiments_pccr/checkpoints/pccr/pccr_oasis_real_20260329-100814/epoch1365-val1.5977.ckpt`
 - trained for 60 epochs
 
 Proxy trend from the training CSV:
@@ -430,7 +430,7 @@ src/pccr_v6/scripts/train.py \
   --phase real \
   --data_source real \
   --config src/pccr_v6/configs/pairwise_oasis_v6b.yaml \
-  --checkpoint_path /u/almik/others/hvit/checkpoints/pccr/pccr_oasis_real_20260329-100814/epoch1365-val1.5977.ckpt \
+  --checkpoint_path /nexus/posix0/MBR-neuralsystems/alim/experiments_pccr/checkpointspccr/pccr_oasis_real_20260329-100814/epoch1365-val1.5977.ckpt \
   --accelerator gpu \
   --num_gpus 4 \
   --dataset_format oasis_fs \
@@ -457,7 +457,7 @@ src/pccr_v6/scripts/train.py \
   --phase real \
   --data_source real \
   --config src/pccr_v6/configs/pairwise_oasis_v6b.yaml \
-  --checkpoint_path /u/almik/others/hvit/checkpoints/pccr_v6/pccr_v6b_residual_structured_handoff_real_main/last.ckpt \
+  --checkpoint_path /nexus/posix0/MBR-neuralsystems/alim/experiments_pccr/checkpointspccr_v6/pccr_v6b_residual_structured_handoff_real_main/last.ckpt \
   --accelerator gpu \
   --num_gpus 4 \
   --dataset_format oasis_fs \

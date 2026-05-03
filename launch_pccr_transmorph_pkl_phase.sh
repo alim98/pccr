@@ -9,17 +9,21 @@ ACCOUNT="${ACCOUNT:-mhf_gpu}"
 QOS="${QOS:-g0008}"
 PARTITION="${PARTITION:-gpu}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-18}"
+JOB_NAME="${JOB_NAME:-pccr_tm_pkl}"
 
 POLL_SECONDS="${POLL_SECONDS:-60}"
 HEARTBEAT_POLLS="${HEARTBEAT_POLLS:-5}"
 RESTART_ON_STATES="${RESTART_ON_STATES:-TIMEOUT PREEMPTED NODE_FAIL}"
 MAX_RESTARTS_WITHOUT_CHECKPOINT="${MAX_RESTARTS_WITHOUT_CHECKPOINT:-2}"
 MAX_TOTAL_RESTARTS="${MAX_TOTAL_RESTARTS:-100}"
+START_CHECKPOINT_POLICY="${START_CHECKPOINT_POLICY:-auto}"
 
 PHASE="${PHASE:-real}"
 RUN_TAG="${RUN_TAG:-$(date +"%Y%m%d-%H%M%S")}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-pccr_transmorph_pkl_${PHASE}_${RUN_TAG}}"
 CHECKPOINT_PATH=""
+INITIAL_CHECKPOINT_PATH=""
+ATTACH_JOB_ID=""
 EXTRA_ARGS=()
 consecutive_restarts_without_checkpoint=0
 total_restarts=0
@@ -34,6 +38,14 @@ while [[ $# -gt 0 ]]; do
       EXPERIMENT_NAME="$2"
       shift 2
       ;;
+    --job_name)
+      JOB_NAME="$2"
+      shift 2
+      ;;
+    --attach_job_id)
+      ATTACH_JOB_ID="$2"
+      shift 2
+      ;;
     --checkpoint_path|--resume_from_checkpoint)
       CHECKPOINT_PATH="$2"
       shift 2
@@ -45,9 +57,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-EXPERIMENT_CHECKPOINT_ROOT="${REPO_ROOT}/checkpoints/pccr/${EXPERIMENT_NAME}"
+EXPERIMENT_CHECKPOINT_ROOT="${PCCR_CHECKPOINT_DIR:-/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${EXPERIMENT_NAME}}"
 LAUNCH_LOG_DIR="${REPO_ROOT}/logs/pccr/${EXPERIMENT_NAME}"
 LAUNCH_LOG_FILE="${LAUNCH_LOG_DIR}/launch.log"
+AIM_RUN_NAME="${AIM_RUN_NAME:-${EXPERIMENT_NAME}}"
+AIM_RUN_HASH_FILE="${AIM_RUN_HASH_FILE:-${LAUNCH_LOG_DIR}/aim_run_hash.txt}"
 
 mkdir -p \
   "${REPO_ROOT}/slurm/output_pccr_tm_pkl" \
@@ -62,24 +76,46 @@ echo "=========================================="
 echo "PCCR TransMorph PKL Phase Launcher"
 echo "Phase: ${PHASE}"
 echo "Experiment: ${EXPERIMENT_NAME}"
+echo "Aim run name: ${AIM_RUN_NAME}"
+echo "Aim hash file: ${AIM_RUN_HASH_FILE}"
 echo "Job script: ${JOB_SCRIPT}"
 echo "Timestamp: $(date)"
 echo "=========================================="
 
 latest_checkpoint() {
   local root="$1"
-  local last_ckpt=""
-  local any_ckpt=""
+  local latest_ckpt=""
 
-  last_ckpt="$(find "${root}" -type f -name 'last.ckpt' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-  any_ckpt="$(find "${root}" -type f -name '*.ckpt' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+  latest_ckpt="$(find "${root}" -type f -name '*.ckpt' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+  printf '%s\n' "${latest_ckpt}"
+}
 
-  if [[ -n "${last_ckpt}" ]]; then
-    printf '%s\n' "${last_ckpt}"
-  elif [[ -n "${any_ckpt}" ]]; then
-    printf '%s\n' "${any_ckpt}"
+resolve_start_checkpoint() {
+  local experiment_root="$1"
+  local requested_ckpt="${2:-}"
+  local policy="${3:-auto}"
+  local experiment_ckpt=""
+
+  case "${policy}" in
+    auto)
+      ;;
+    requested)
+      if [[ -n "${requested_ckpt}" ]]; then
+        printf '%s\n' "${requested_ckpt}"
+        return
+      fi
+      ;;
+    *)
+      echo "[phase_launcher] Unknown START_CHECKPOINT_POLICY=${policy}" >&2
+      exit 1
+      ;;
+  esac
+
+  experiment_ckpt="$(latest_checkpoint "${experiment_root}")"
+  if [[ -n "${experiment_ckpt}" ]]; then
+    printf '%s\n' "${experiment_ckpt}"
   else
-    printf '\n'
+    printf '%s\n' "${requested_ckpt}"
   fi
 }
 
@@ -127,12 +163,24 @@ join_exports() {
   printf '%s' "${joined}"
 }
 
+read_aim_run_hash() {
+  if [[ -n "${AIM_RUN_HASH:-}" ]]; then
+    printf '%s\n' "${AIM_RUN_HASH}"
+    return
+  fi
+  if [[ -s "${AIM_RUN_HASH_FILE}" ]]; then
+    head -n 1 "${AIM_RUN_HASH_FILE}" | tr -d '[:space:]'
+  fi
+}
+
 submit_job() {
   local resume_ckpt="${1:-}"
   local sbatch_out=""
   local resume_export=""
+  local aim_run_hash=""
   local cmd=(
     sbatch --parsable
+    -J "${JOB_NAME}"
     -A "${ACCOUNT}"
     --qos="${QOS}"
     -p "${PARTITION}"
@@ -148,17 +196,26 @@ submit_job() {
     fi
   fi
 
+  aim_run_hash="$(read_aim_run_hash)"
+
   local export_arg
   export_arg="$(join_exports \
     "EXPERIMENT_NAME=${EXPERIMENT_NAME}" \
+    "AIM_RUN_NAME=${AIM_RUN_NAME}" \
+    "AIM_RUN_HASH_FILE=${AIM_RUN_HASH_FILE}" \
+    "AIM_RUN_HASH=${aim_run_hash}" \
+    "PCCR_CHECKPOINT_DIR=${EXPERIMENT_CHECKPOINT_ROOT}" \
     "PHASE=${PHASE}" \
     "DDP_FIND_UNUSED_PARAMETERS=${DDP_FIND_UNUSED_PARAMETERS:-auto}" \
     "FINAL_COST_VOLUME_MODE=${FINAL_COST_VOLUME_MODE:-streamed}" \
     "FINAL_COST_VOLUME_CHUNK_SIZE=${FINAL_COST_VOLUME_CHUNK_SIZE:-16}" \
+    "CHECKPOINT_EVERY_N_EPOCHS=${TARGET_CHECKPOINT_EVERY_N_EPOCHS:-${CHECKPOINT_EVERY_N_EPOCHS:-1}}" \
     "CHECKPOINT_EVERY_N_TRAIN_STEPS=${CHECKPOINT_EVERY_N_TRAIN_STEPS:-500}" \
-    "CHECK_VAL_EVERY_N_EPOCH=${CHECK_VAL_EVERY_N_EPOCH:-10}" \
+    "CHECK_VAL_EVERY_N_EPOCH=${TARGET_CHECK_VAL_EVERY_N_EPOCH:-${CHECK_VAL_EVERY_N_EPOCH:-1}}" \
     "LOG_EVERY_N_STEPS=${LOG_EVERY_N_STEPS:-10}" \
     "MAX_VAL_PAIRS=${MAX_VAL_PAIRS:-19}" \
+    "ITER_EVAL_EVERY_N_EPOCHS=${ITER_EVAL_EVERY_N_EPOCHS:-0}" \
+    "ITER_EVAL_NUM_PAIRS=${ITER_EVAL_NUM_PAIRS:-${MAX_VAL_PAIRS:-19}}" \
     "PYTHONDONTWRITEBYTECODE=${PYTHONDONTWRITEBYTECODE:-1}" \
     "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
     "MAX_EPOCHS=${MAX_EPOCHS:-500}" \
@@ -178,9 +235,8 @@ submit_job() {
   printf '%s\n' "${sbatch_out}"
 }
 
-if [[ -z "${CHECKPOINT_PATH}" ]]; then
-  CHECKPOINT_PATH="$(latest_checkpoint "${EXPERIMENT_CHECKPOINT_ROOT}")"
-fi
+CHECKPOINT_PATH="$(resolve_start_checkpoint "${EXPERIMENT_CHECKPOINT_ROOT}" "${CHECKPOINT_PATH}" "${START_CHECKPOINT_POLICY}")"
+INITIAL_CHECKPOINT_PATH="${CHECKPOINT_PATH}"
 
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
   echo "[phase_launcher] Initial checkpoint: ${CHECKPOINT_PATH}"
@@ -188,15 +244,20 @@ else
   echo "[phase_launcher] No checkpoint found. Starting fresh."
 fi
 
-if ! job_id="$(submit_job "${CHECKPOINT_PATH}")"; then
-  echo "[phase_launcher] Initial submission failed. Stopping launcher."
-  exit 1
+if [[ -n "${ATTACH_JOB_ID}" ]]; then
+  job_id="${ATTACH_JOB_ID}"
+  echo "[phase_launcher] Attaching to existing job ${job_id}"
+else
+  if ! job_id="$(submit_job "${CHECKPOINT_PATH}")"; then
+    echo "[phase_launcher] Initial submission failed. Stopping launcher."
+    exit 1
+  fi
+  if [[ -z "${job_id}" ]]; then
+    echo "[phase_launcher] Initial submission returned an empty job id. Stopping launcher."
+    exit 1
+  fi
+  echo "[phase_launcher] Submitted job ${job_id}"
 fi
-if [[ -z "${job_id}" ]]; then
-  echo "[phase_launcher] Initial submission returned an empty job id. Stopping launcher."
-  exit 1
-fi
-echo "[phase_launcher] Submitted job ${job_id}"
 
 trap 'echo "[phase_launcher] Interrupted. Last submitted job: ${job_id}"; exit 130' INT TERM
 
@@ -234,6 +295,10 @@ while true; do
       if [[ -n "${CHECKPOINT_PATH}" ]]; then
         consecutive_restarts_without_checkpoint=0
         echo "[phase_launcher] Restarting from checkpoint: ${CHECKPOINT_PATH}"
+      elif [[ -n "${INITIAL_CHECKPOINT_PATH}" ]]; then
+        CHECKPOINT_PATH="${INITIAL_CHECKPOINT_PATH}"
+        consecutive_restarts_without_checkpoint=0
+        echo "[phase_launcher] No in-experiment checkpoint found after ${state}. Falling back to initial checkpoint: ${CHECKPOINT_PATH}"
       else
         consecutive_restarts_without_checkpoint=$((consecutive_restarts_without_checkpoint + 1))
         if (( consecutive_restarts_without_checkpoint > MAX_RESTARTS_WITHOUT_CHECKPOINT )); then

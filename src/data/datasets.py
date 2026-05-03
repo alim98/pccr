@@ -499,10 +499,15 @@ def get_dataloader(
     else:
         raise ValueError(f"Unsupported dataset format: {resolved_format}")
 
-    dataloader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle and not is_pair,
-        num_workers=num_workers,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle and not is_pair,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
+    dataloader = torch.utils.data.DataLoader(ds, **loader_kwargs)
     return dataloader

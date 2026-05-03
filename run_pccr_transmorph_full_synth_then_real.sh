@@ -38,7 +38,7 @@ printf ' %q' "${SYN_CMD[@]}"
 printf '\n'
 "${SYN_CMD[@]}"
 
-FINAL_SYNTH_CKPT="${REPO_ROOT}/checkpoints/pccr/${SYN_EXPERIMENT_NAME}/last.ckpt"
+FINAL_SYNTH_CKPT="/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/pccr/${SYN_EXPERIMENT_NAME}/last.ckpt"
 if [[ ! -s "${FINAL_SYNTH_CKPT}" ]]; then
   echo "[full_launcher] Synthetic completed, but checkpoint was not found: ${FINAL_SYNTH_CKPT}" >&2
   exit 1

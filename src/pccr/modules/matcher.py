@@ -163,7 +163,14 @@ class _BaseCorrelationMatcher(nn.Module):
 
         if target_matchability is not None:
             best_index = probabilities.argmax(dim=-1, keepdim=True)
-            best_target_matchability = torch.gather(target_matchability, dim=-1, index=best_index).squeeze(-1)
+            if target_matchability.dim() == probabilities.dim() - 1:
+                best_target_matchability = torch.gather(
+                    target_matchability,
+                    dim=-1,
+                    index=best_index.squeeze(-1),
+                )
+            else:
+                best_target_matchability = torch.gather(target_matchability, dim=-1, index=best_index).squeeze(-1)
             confidence = confidence * torch.sqrt((source_matchability * best_target_matchability).clamp_min(1e-6))
         else:
             confidence = confidence * source_matchability
@@ -181,7 +188,10 @@ class _BaseCorrelationMatcher(nn.Module):
         spatial_shape: tuple[int, int, int],
         target_matchability: torch.Tensor | None = None,
     ) -> MatchOutputs:
-        expected_target_positions = torch.einsum("bij,bijd->bid", probabilities, target_positions)
+        if target_positions.dim() == 3:
+            expected_target_positions = torch.bmm(probabilities, target_positions)
+        else:
+            expected_target_positions = torch.einsum("bij,bijd->bid", probabilities, target_positions)
         raw_displacement = (expected_target_positions - source_positions).transpose(1, 2).contiguous()
         raw_displacement = raw_displacement.view(source_positions.shape[0], 3, *spatial_shape)
         raw_displacement = torch.nan_to_num(raw_displacement, nan=0.0, posinf=0.0, neginf=0.0)
@@ -236,7 +246,7 @@ class _BaseCorrelationMatcher(nn.Module):
 
 
 class CanonicalCorrelationMatcher(_BaseCorrelationMatcher):
-    """Dense matcher guided by canonical coordinates and descriptor affinity."""
+    """Top-k matcher guided by canonical coordinates and descriptor affinity."""
 
     def forward(
         self,
@@ -248,42 +258,60 @@ class CanonicalCorrelationMatcher(_BaseCorrelationMatcher):
         if self._should_skip_global_matching(flattened, stage_id=stage_id):
             return None
         canonical_distance = torch.cdist(flattened["src_canonical"], flattened["tgt_canonical"])
-        descriptor_similarity = torch.einsum(
-            "bid,bjd->bij",
-            flattened["src_descriptor"],
-            flattened["tgt_descriptor"],
-        )
-
         num_voxels = canonical_distance.shape[-1]
         topk = min(self.topk, num_voxels)
-        _, nearest_indices = canonical_distance.topk(topk, dim=-1, largest=False)
-        allowed_mask = torch.zeros_like(canonical_distance, dtype=torch.bool)
-        allowed_mask.scatter_(-1, nearest_indices, True)
-        allowed_mask = allowed_mask | (canonical_distance <= self.canonical_radius)
+        candidate_distances, candidate_indices = canonical_distance.topk(topk, dim=-1, largest=False)
+        candidate_valid = candidate_distances <= self.canonical_radius
+        candidate_valid[..., 0] = True
+        del canonical_distance
 
-        uncertainty_penalty = flattened["src_uncertainty"].unsqueeze(-1) + flattened["tgt_uncertainty"].unsqueeze(1)
-        scores = descriptor_similarity - canonical_distance - 0.1 * uncertainty_penalty
-        scores = scores.masked_fill(~allowed_mask, -1e4)
+        source_descriptor = flattened["src_descriptor"].unsqueeze(2).expand(-1, -1, topk, -1)
+        target_descriptor = _batched_gather(flattened["tgt_descriptor"], candidate_indices)
+        target_positions = _batched_gather(flattened["target_positions"], candidate_indices)
+        source_uncertainty = flattened["src_uncertainty"].unsqueeze(-1).expand(-1, -1, topk)
+        target_uncertainty = _batched_gather_scalar(flattened["tgt_uncertainty"], candidate_indices)
+        source_matchability = flattened["source_matchability"].unsqueeze(-1).expand(-1, -1, topk)
+        target_matchability = _batched_gather_scalar(flattened["target_matchability"], candidate_indices)
+
+        descriptor_similarity = (source_descriptor * target_descriptor).sum(dim=-1)
+        uncertainty_penalty = source_uncertainty + target_uncertainty
+        scores = descriptor_similarity - candidate_distances - 0.1 * uncertainty_penalty
+        scores = scores.masked_fill(~candidate_valid, -1e4)
         if self.matchability_score_mode == "legacy":
-            scores = scores + flattened["target_matchability"].unsqueeze(1).log().clamp_min(-20.0)
+            scores = scores + target_matchability.log().clamp_min(-20.0)
             probabilities = F.softmax(scores / self.temperature, dim=-1)
         else:
             probabilities = F.softmax(scores / self.temperature, dim=-1)
-            pair_matchability = (
-                flattened["source_matchability"].unsqueeze(-1)
-                * flattened["target_matchability"].unsqueeze(1)
-            ).clamp_min(1e-6)
+            pair_matchability = (source_matchability * target_matchability).clamp_min(1e-6)
             probabilities = probabilities * pair_matchability.pow(self.matchability_score_power)
             probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        probabilities = torch.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
 
-        target_matchability = flattened["target_matchability"].unsqueeze(1).expand_as(probabilities)
-        return self._finalize_outputs(
-            target_positions=flattened["target_positions"].unsqueeze(1).expand(-1, probabilities.shape[1], -1, -1),
-            source_positions=flattened["source_positions"],
+        expected_target_positions = (probabilities.unsqueeze(-1) * target_positions).sum(dim=2)
+        source_positions = flattened["source_positions"]
+        raw_displacement = (expected_target_positions - source_positions).transpose(1, 2).contiguous()
+        raw_displacement = raw_displacement.view(source.canonical_coords.shape[0], 3, *flattened["spatial_shape"])
+        raw_displacement = torch.nan_to_num(raw_displacement, nan=0.0, posinf=0.0, neginf=0.0)
+
+        confidence, entropy, margin = self._confidence_from_probabilities(
             probabilities=probabilities,
             source_matchability=flattened["source_matchability"],
-            spatial_shape=flattened["spatial_shape"],
             target_matchability=target_matchability,
+        )
+        confidence = confidence.view(source.canonical_coords.shape[0], 1, *flattened["spatial_shape"])
+        margin = margin.view(source.canonical_coords.shape[0], 1, *flattened["spatial_shape"])
+        entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0).view(
+            source.canonical_coords.shape[0], 1, *flattened["spatial_shape"]
+        )
+
+        return MatchOutputs(
+            expected_target_positions=expected_target_positions,
+            raw_displacement=raw_displacement,
+            probabilities=probabilities,
+            confidence=confidence,
+            margin=margin,
+            entropy=entropy,
+            source_positions=source_positions,
         )
 
 

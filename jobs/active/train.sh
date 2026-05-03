@@ -37,7 +37,7 @@ mkdir -p \
   "${REPO_ROOT}/slurm/output_hvit" \
   "${REPO_ROOT}/slurm/error_hvit" \
   "${REPO_ROOT}/logs" \
-  "${REPO_ROOT}/checkpoints" \
+  "/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints" \
   "${AIM_REPO_DEFAULT}"
 
 if command -v conda >/dev/null 2>&1; then
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 export HVIT_LOG_ROOT="${REPO_ROOT}/logs/${EXPERIMENT_NAME}"
-export HVIT_CHECKPOINT_ROOT="${REPO_ROOT}/checkpoints/${EXPERIMENT_NAME}"
+export HVIT_CHECKPOINT_ROOT="/u/almik/others/hvit/symlinks/experiments_pccr/checkpoints/${EXPERIMENT_NAME}"
 mkdir -p "${HVIT_LOG_ROOT}" "${HVIT_CHECKPOINT_ROOT}"
 
 TRAIN_CMD=(

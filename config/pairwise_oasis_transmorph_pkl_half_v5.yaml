@@ -1,0 +1,77 @@
+base_config: ../src/pccr/configs/pairwise_oasis_v5.yaml
+
+data_size:
+  - 80
+  - 96
+  - 112
+
+align_data_size_to_native_shape: false
+eval_label_ids:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
+  - 24
+  - 25
+  - 26
+  - 27
+  - 28
+  - 29
+  - 30
+  - 31
+  - 32
+  - 33
+  - 34
+  - 35
+num_labels: 36
+
+use_gradient_checkpointing: false
+batch_size: 1
+gradient_accumulation_steps: 1
+
+pointmap_stage_ids:
+  - 2
+  - 3
+
+use_stage2_local_refinement: false
+stage2_local_refinement_radius: 0
+stage2_local_refinement_proj_channels: 16
+stage2_local_refinement_feature_channels: 16
+stage2_local_refinement_temperature: 1.0
+
+use_stage1_local_refinement: true
+stage1_local_refinement_radius: 2
+stage1_local_refinement_proj_channels: 16
+stage1_local_refinement_feature_channels: 16
+stage1_local_refinement_temperature: 1.0
+stage1_local_refinement_memory_efficient: false
+stage1_local_refinement_offset_chunk_size: 32
+
+use_final_residual_refinement: true
+final_refinement_use_local_cost_volume: false
+final_refinement_cost_volume_radius: 0
+final_refinement_memory_efficient_cost_volume: false
+final_refinement_cost_volume_offset_chunk_size: 16
+final_refinement_use_local_residual_matcher: false
+
+refinement_warmup_epochs: 0
+phase: real

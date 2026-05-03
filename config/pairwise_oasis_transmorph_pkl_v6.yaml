@@ -1,0 +1,94 @@
+base_config: ./pairwise_oasis_transmorph_pkl_full_final.yaml
+
+data_size:
+  - 160
+  - 192
+  - 224
+
+# Full-res stage-2 has 40x48x56=107520 voxels, so dense global canonical
+# matching is intentionally kept at stage 3.  Stage-2 alignment comes from the
+# inherited memory-efficient local correlation refiner.
+pointmap_stage_ids:
+  - 3
+
+# fix the cost-volume channels that were incorrectly left at 8 in v5
+final_refinement_cost_volume_proj_channels: 16
+final_refinement_cost_volume_feature_channels: 16
+
+# 4x stronger direct dice gradient (same as v5)
+segmentation_supervision_weight: 0.20
+
+# full-res regularization requires a slightly higher weight to compensate
+# for the fact that we no longer halve the displacement before computing smoothness
+smoothness_weight: 0.02
+jacobian_weight: 0.005
+
+# image loss unchanged from full_final
+image_loss_weight: 1.25
+multiscale_similarity_factors:
+  - 1
+  - 2
+multiscale_similarity_weights:
+  - 1.0
+  - 0.25
+
+# stabilise inverse-consistency coupling across scales
+inverse_consistency_weight: 0.05
+correspondence_weight: 0.1
+
+# decoder fitting: keep the same confidence-gated target from full_final
+decoder_fitting_weight: 0.1
+decoder_fitting_detach_target: true
+decoder_fitting_entropy_threshold: 0.9
+decoder_fitting_confidence_percentile: 0.5
+decoder_fitting_margin_power: 1.0
+decoder_fitting_margin_min: 0.0
+
+# per-module LR: bump refinement scale so the re-initialised cost-vol encoder
+# (channels 8->16, new shape) gets enough budget to re-train from scratch
+encoder_lr_scale: 1.0
+canonical_head_lr_scale: 1.0
+coarse_decoder_lr_scale: 1.0
+residual_refinement_lr_scale: 2.0
+
+lr_min_ratio: 0.01
+refinement_warmup_epochs: 0
+
+use_gradient_checkpointing: true
+use_amp: true
+batch_size: 1
+gradient_accumulation_steps: 4
+
+matchability_score_mode: soft
+matchability_score_power: 0.5
+
+residual_velocity_weight: 0.0
+
+final_refinement_hidden_channels: 32
+final_refinement_num_blocks: 2
+final_refinement_activation: leaky_relu
+final_refinement_max_velocity: 0.2
+final_refinement_include_raw_image_error_inputs: true
+final_refinement_use_image_error_inputs: false
+final_refinement_use_error_edges: false
+
+# v6 decoder additions: optional stage-0 local cost-volume at full resolution
+use_stage0_local_refinement: false
+stage0_local_refinement_radius: 0
+stage0_local_refinement_proj_channels: 16
+stage0_local_refinement_feature_channels: 16
+stage0_local_refinement_temperature: 1.0
+stage0_local_refinement_memory_efficient: true
+stage0_local_refinement_offset_chunk_size: 32
+stage_local_refinement_gate_with_prior: false
+stage_local_refinement_prior_confidence_power: 0.5
+use_structured_match_handoff: false
+structured_match_handoff_topm: 2
+structured_match_handoff_channels: 16
+structured_match_adapter_hidden_channels: 32
+structured_match_adapter_velocity_scale: 0.25
+
+# No cold pointmap stages in the warm-start path.  Stage-2 local refinement is
+# already present in the full_final checkpoint and is warm-started.
+new_stage_ids: []
+new_stage_warmup_epochs: 0
